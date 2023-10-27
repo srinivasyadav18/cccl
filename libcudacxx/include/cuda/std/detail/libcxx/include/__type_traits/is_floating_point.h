@@ -14,6 +14,9 @@
 #include <__config>
 #endif // __cuda_std__
 
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
 #include "../__type_traits/integral_constant.h"
 #include "../__type_traits/remove_cv.h"
 
@@ -26,6 +29,8 @@ _CCCL_IMPLICIT_SYSTEM_HEADER
 _LIBCUDACXX_BEGIN_NAMESPACE_STD
 
 template <class _Tp> struct __libcpp_is_floating_point              : public false_type {};
+template <>          struct __libcpp_is_floating_point<__half>       : public true_type {};
+template <>          struct __libcpp_is_floating_point<__nv_bfloat16>       : public true_type {};
 template <>          struct __libcpp_is_floating_point<float>       : public true_type {};
 template <>          struct __libcpp_is_floating_point<double>      : public true_type {};
 template <>          struct __libcpp_is_floating_point<long double> : public true_type {};

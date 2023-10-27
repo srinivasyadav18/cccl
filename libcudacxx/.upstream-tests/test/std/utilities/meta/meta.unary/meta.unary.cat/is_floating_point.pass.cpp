@@ -78,6 +78,8 @@ typedef void (*FunctionPtr)();
 
 int main(int, char**)
 {
+    test_is_floating_point<__half>();
+    test_is_floating_point<__nv_bfloat16>();
     test_is_floating_point<float>();
     test_is_floating_point<double>();
     test_is_floating_point<long double>();
