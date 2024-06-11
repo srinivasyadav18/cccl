@@ -31,26 +31,6 @@
 
 THRUST_NAMESPACE_BEGIN
 
-// forward definitions for is_commutative
-template <typename T>
-struct plus;
-template <typename T>
-struct multiplies;
-template <typename T>
-struct minimum;
-template <typename T>
-struct maximum;
-template <typename T>
-struct logical_or;
-template <typename T>
-struct logical_and;
-template <typename T>
-struct bit_or;
-template <typename T>
-struct bit_and;
-template <typename T>
-struct bit_xor;
-
 namespace detail
 {
 
