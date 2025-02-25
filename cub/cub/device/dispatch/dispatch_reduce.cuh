@@ -982,8 +982,32 @@ template <typename MaxPolicyT,
 struct DeviceFixedSizeSegmentedReduceKernelSource
 {
   CUB_DEFINE_KERNEL_GETTER(
-    FixedSizeSegmentedReduceKernel,
-    DeviceFixedSizeSegmentedReduceKernel<
+    SmallFixedSizeSegmentedReduceKernel,
+    DeviceSmallFixedSizeSegmentedReduceKernel<
+      MaxPolicyT,
+      InputIteratorT,
+      OutputIteratorT,
+      OffsetT,
+      SegmentSizeT,
+      ReductionOpT,
+      InitT,
+      AccumT>)
+
+  CUB_DEFINE_KERNEL_GETTER(
+    MediumFixedSizeSegmentedReduceKernel,
+    DeviceMediumFixedSizeSegmentedReduceKernel<
+      MaxPolicyT,
+      InputIteratorT,
+      OutputIteratorT,
+      OffsetT,
+      SegmentSizeT,
+      ReductionOpT,
+      InitT,
+      AccumT>)
+
+  CUB_DEFINE_KERNEL_GETTER(
+    LargeFixedSizeSegmentedReduceKernel,
+    DeviceLargeFixedSizeSegmentedReduceKernel<
       MaxPolicyT,
       InputIteratorT,
       OutputIteratorT,
@@ -1107,9 +1131,9 @@ struct DispatchFixedSizeSegmentedReduce
    *   Kernel function pointer to parameterization of
    *   cub::DeviceFixedSizeSegmentedReduceKernel
    */
-  template <typename ActivePolicyT, typename DeviceFixedSizeSegmentedReduceKernelT>
+  template <typename ActivePolicyT, typename SmallKernelT, typename MediumKernelT, typename LargeKernelT>
   CUB_RUNTIME_FUNCTION _CCCL_VISIBILITY_HIDDEN _CCCL_FORCEINLINE cudaError_t
-  InvokePasses(DeviceFixedSizeSegmentedReduceKernelT fixed_size_segmented_reduce_kernel)
+  InvokePasses(SmallKernelT small_kernel, MediumKernelT medium_kernel, LargeKernelT large_kenel)
   {
     cudaError error = cudaSuccess;
 
@@ -1123,19 +1147,26 @@ struct DispatchFixedSizeSegmentedReduce
         return cudaSuccess;
       }
 
-      int blocks = num_segments;
+      int blocks;
       if (segment_size <= ActivePolicyT::SmallReducePolicy::ITEMS_PER_TILE)
       {
         blocks = cuda::ceil_div(num_segments, ActivePolicyT::SmallReducePolicy::SEGMENTS_PER_BLOCK);
+        launcher_factory(blocks, ActivePolicyT::ReducePolicy::BLOCK_THREADS, 0, stream)
+          .doit(small_kernel, d_in, d_out, segment_size, num_segments, reduction_op, init);
       }
       else if (segment_size <= ActivePolicyT::MediumReducePolicy::ITEMS_PER_TILE)
       {
         blocks = cuda::ceil_div(num_segments, ActivePolicyT::MediumReducePolicy::SEGMENTS_PER_BLOCK);
+        launcher_factory(blocks, ActivePolicyT::ReducePolicy::BLOCK_THREADS, 0, stream)
+          .doit(medium_kernel, d_in, d_out, segment_size, num_segments, reduction_op, init);
       }
-
+      else
+      {
+        blocks = num_segments;
+        launcher_factory(blocks, ActivePolicyT::ReducePolicy::BLOCK_THREADS, 0, stream)
+          .doit(large_kenel, d_in, d_out, segment_size, num_segments, reduction_op, init);
+      }
       // Invoke DeviceReduceKernel
-      launcher_factory(blocks, ActivePolicyT::ReducePolicy::BLOCK_THREADS, 0, stream)
-        .doit(fixed_size_segmented_reduce_kernel, d_in, d_out, segment_size, num_segments, reduction_op, init);
 
       // Check for failure to launch
       error = CubDebug(cudaPeekAtLastError());
@@ -1159,7 +1190,10 @@ struct DispatchFixedSizeSegmentedReduce
   template <typename ActivePolicyT>
   CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t Invoke()
   {
-    return InvokePasses<ActivePolicyT>(kernel_source.FixedSizeSegmentedReduceKernel());
+    return InvokePasses<ActivePolicyT>(
+      kernel_source.SmallFixedSizeSegmentedReduceKernel(),
+      kernel_source.MediumFixedSizeSegmentedReduceKernel(),
+      kernel_source.LargeFixedSizeSegmentedReduceKernel());
   }
 
   //---------------------------------------------------------------------------
