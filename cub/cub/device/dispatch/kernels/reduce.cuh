@@ -360,12 +360,12 @@ __launch_bounds__(int(ChainedPolicyT::ActivePolicy::ReducePolicy::BLOCK_THREADS)
   int count = 0;
 
   _CCCL_PRAGMA_UNROLL_FULL()
-  for (int i = tid; i < num_items; i += items_per_thread * reduce_grid_size * block_threads)
+  for (::cuda::std::uint32_t i = tid; i < num_items; i += items_per_thread * reduce_grid_size * block_threads)
   {
     ftype items[items_per_thread] = {};
     for (int j = 0; j < items_per_thread; j++)
     {
-      const int idx = i + j * reduce_grid_size * block_threads;
+      const ::cuda::std::uint32_t idx = i + j * reduce_grid_size * block_threads;
       if (idx < num_items)
       {
         items[j] = transform_op(d_in[idx]);
