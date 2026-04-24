@@ -872,6 +872,8 @@ struct policy_selector
   bool accum_is_primitive_or_trivially_copy_constructible;
   // TODO(griwes): remove this field before policy_selector is publicly exposed
   bool benchmark_match;
+  // Force warpspeed on SM90+ when run-to-run determinism is requested
+  bool force_warpspeed_for_determinism = false;
 
   _CCCL_API constexpr auto get_sm100_fallback_warpspeed_policy() const -> scan_warpspeed_policy
   {
@@ -952,6 +954,11 @@ struct policy_selector
         }
       }
 
+      return get_sm100_fallback_warpspeed_policy();
+    }
+    // SM90 determinism path: warpspeed is safe (static scheduling avoids SM100-only cluster-launch-control).
+    if (force_warpspeed_for_determinism && arch >= ::cuda::arch_id::sm_90)
+    {
       return get_sm100_fallback_warpspeed_policy();
     }
     return {};
@@ -1399,7 +1406,12 @@ struct benchmark_match_for_policy_selector<
 };
 
 // stateless version which can be passed to kernels
-template <typename InputIteratorT, typename OutputIteratorT, typename AccumT, typename OffsetT, typename ScanOpT>
+template <typename InputIteratorT,
+          typename OutputIteratorT,
+          typename AccumT,
+          typename OffsetT,
+          typename ScanOpT,
+          bool ForceWarpspeedForDeterminism = false>
 struct policy_selector_from_types
 {
   [[nodiscard]] _CCCL_API constexpr auto operator()(::cuda::arch_id arch) const -> scan_policy
@@ -1430,7 +1442,8 @@ struct policy_selector_from_types
       ::cuda::std::is_trivially_copyable_v<OutputValueT>,
       ::cuda::std::is_default_constructible_v<OutputValueT>,
       accum_is_primitive_or_trivially_copy_constructible,
-      benchmark_match};
+      benchmark_match,
+      ForceWarpspeedForDeterminism};
     return policies(arch);
   }
 };

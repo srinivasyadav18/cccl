@@ -353,14 +353,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
 
     if constexpr (!RunToRunDeterministic)
     {
-      if (squad == squadSched)
-      {
-        ////////////////////////////////////////////////////////////////////////////////
-        // Load next tile index
-        ////////////////////////////////////////////////////////////////////////////////
-        warpspeed::SmemRef refNextBlockIdxW = phaseNextBlockIdxW.acquireRef();
-        squadGetNextBlockIdx(squad, refNextBlockIdxW);
-      }
+      // clusterlaunchcontrol.try_cancel is SM100-only; guard so the non-det instantiation compiles on SM90.
+      NV_IF_TARGET(NV_PROVIDES_SM_100, ({
+                     if (squad == squadSched)
+                     {
+                       warpspeed::SmemRef refNextBlockIdxW = phaseNextBlockIdxW.acquireRef();
+                       squadGetNextBlockIdx(squad, refNextBlockIdxW);
+                     }
+                   }));
     }
 
     const ::cuda::std::size_t idxTileBase = idxTile * ::cuda::std::size_t(tile_size);
@@ -383,14 +383,17 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
     ////////////////////////////////////////////////////////////////////////////////
     // Get next tile index (all squads)
     ////////////////////////////////////////////////////////////////////////////////
-    uint4 regNextBlockIdx{};
+    [[maybe_unused]] uint4 regNextBlockIdx{};
     bool nextIdxTileValid = false;
     if constexpr (!RunToRunDeterministic)
     {
-      warpspeed::SmemRef refNextBlockIdxR = phaseNextBlockIdxR.acquireRef();
-      regNextBlockIdx                     = refNextBlockIdxR.data();
-      refNextBlockIdxR.setFenceLdsToAsyncProxy();
-      nextIdxTileValid = ::cuda::ptx::clusterlaunchcontrol_query_cancel_is_canceled(regNextBlockIdx);
+      // clusterlaunchcontrol.query_cancel.* is SM100-only.
+      NV_IF_TARGET(NV_PROVIDES_SM_100, ({
+                     warpspeed::SmemRef refNextBlockIdxR = phaseNextBlockIdxR.acquireRef();
+                     regNextBlockIdx                     = refNextBlockIdxR.data();
+                     refNextBlockIdxR.setFenceLdsToAsyncProxy();
+                     nextIdxTileValid = ::cuda::ptx::clusterlaunchcontrol_query_cancel_is_canceled(regNextBlockIdx);
+                   }));
     }
     else
     {
@@ -810,7 +813,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
     }
     else
     {
-      idxTile = ::cuda::ptx::clusterlaunchcontrol_query_cancel_get_first_ctaid_x<int>(regNextBlockIdx);
+      NV_IF_TARGET(NV_PROVIDES_SM_100, ({
+                     idxTile = ::cuda::ptx::clusterlaunchcontrol_query_cancel_get_first_ctaid_x<int>(regNextBlockIdx);
+                   }));
     }
   }
 
