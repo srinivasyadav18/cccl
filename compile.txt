@@ -1,0 +1,3 @@
+[0/2] Re-checking globbed directories...
+[1/3] Building CUDA object cudax/test/CMakeFiles/cudax.test.cuco_static_map.dir/cuco/static_map/test_static_map.cu.o
+[2/3] Linking CXX executable bin/cudax.test.cuco_static_map
