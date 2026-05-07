@@ -24,6 +24,8 @@
 #include <cuda/std/__type_traits/is_constant_evaluated.h>
 #include <cuda/std/cstdint>
 
+#include <nv/target>
+
 CUB_NAMESPACE_BEGIN
 
 namespace detail::warpspeed
@@ -145,13 +147,24 @@ struct SmemResourceRaw
   _CCCL_DEVICE_API void releaseTx(int phase, int txCount)
   {
     _WS_CONSTANT_ASSERT(phase < mNumPhases, "Phase exceeds limit.");
-    ::cuda::ptx::mbarrier_arrive_expect_tx(
-      ::cuda::ptx::sem_release, ::cuda::ptx::scope_cta, ::cuda::ptx::space_shared, ptrCurBarrierRelease(phase), txCount);
+    NV_IF_ELSE_TARGET(
+      NV_PROVIDES_SM_90,
+      (::cuda::ptx::mbarrier_arrive_expect_tx(
+         ::cuda::ptx::sem_release,
+         ::cuda::ptx::scope_cta,
+         ::cuda::ptx::space_shared,
+         ptrCurBarrierRelease(phase),
+         txCount);),
+      (
+        // SM<90: cp.async.mbarrier.arrive (issued in the cp.async load path) handles the arrive
+        // for each owning thread on completion of its cp.async ops. No expect_tx tracking exists,
+        // so this destructor-side call must do nothing.
+        (void) txCount;));
   }
 
   _CCCL_DEVICE_API void fenceLdsToAsyncProxy()
   {
-    ::cuda::ptx::fence_proxy_async(::cuda::ptx::space_shared);
+    NV_IF_TARGET(NV_PROVIDES_SM_90, (::cuda::ptx::fence_proxy_async(::cuda::ptx::space_shared);));
   }
 
   _CCCL_DEVICE_API void releaseLdsToAsyncProxy(int phase)
@@ -171,9 +184,10 @@ struct SmemResourceRaw
     int phaseAcq                       = (mNumPhases + phase - 1) % mNumPhases;
     ::cuda::std::uint64_t* ptrBarPhase = mPtrBar[phaseAcq];
 
-    while (!::cuda::ptx::mbarrier_try_wait_parity(&ptrBarPhase[mStageCurrent], mParity[phase]))
-    {
-    }
+    // mbarrier.try_wait.parity is SM_90+; SM<90 uses the test_wait.parity variant in a busy-poll loop.
+    NV_IF_ELSE_TARGET(NV_PROVIDES_SM_90,
+                      (while (!::cuda::ptx::mbarrier_try_wait_parity(&ptrBarPhase[mStageCurrent], mParity[phase])){}),
+                      (while (!::cuda::ptx::mbarrier_test_wait_parity(&ptrBarPhase[mStageCurrent], mParity[phase])){}));
   }
 };
 } // namespace detail::warpspeed

@@ -174,7 +174,7 @@ struct DeviceScan
     // plus operator
     static_assert(!is_determinism_required || is_safe_integral_op || is_fp_plus_op,
                   "run_to_run deterministic scan requires either integral types with known operators, "
-                  "or floating-point types with plus operator (requires sm_100+ for warpspeed scan)");
+                  "or floating-point types with plus operator (requires sm_80+ for warpspeed scan)");
 
     // gpu_to_gpu determinism is only supported with integral types with known operators
     static_assert(!is_gpu_to_gpu_required || is_safe_integral_op,

@@ -105,7 +105,10 @@ struct SyncHandler
     // block as a parameter.
 
     // TODO: This could use vectorized mbarrier initialization
-    if (sr.warpIdx == 0 && ::cuda::ptx::elect_sync(~0))
+    bool is_init_lane = false;
+    NV_IF_ELSE_TARGET(
+      NV_PROVIDES_SM_90, (is_init_lane = ::cuda::ptx::elect_sync(~0);), (is_init_lane = (sr.laneIdx == 0);));
+    if (sr.warpIdx == 0 && is_init_lane)
     {
       for (int ri = 0; ri < mMaxNumResources; ++ri)
       {
@@ -138,11 +141,17 @@ struct SyncHandler
 
   _CCCL_DEVICE_API void clusterInitSync(SpecialRegisters sr)
   {
-    NV_IF_TARGET(NV_PROVIDES_SM_90, ({
-                   clusterInitSync(sr, SkipSync{});
-                   __cluster_barrier_arrive_relaxed();
-                   __cluster_barrier_wait();
-                 }))
+    NV_IF_ELSE_TARGET(
+      NV_PROVIDES_SM_90,
+      ({
+        clusterInitSync(sr, SkipSync{});
+        __cluster_barrier_arrive_relaxed();
+        __cluster_barrier_wait();
+      }),
+      ({
+        clusterInitSync(sr, SkipSync{});
+        __syncthreads();
+      }));
   }
 };
 } // namespace detail::warpspeed

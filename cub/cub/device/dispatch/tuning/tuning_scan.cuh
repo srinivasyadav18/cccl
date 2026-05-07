@@ -956,8 +956,9 @@ struct policy_selector
 
       return get_sm100_fallback_warpspeed_policy();
     }
-    // SM90 determinism path: warpspeed is safe (static scheduling avoids SM100-only cluster-launch-control).
-    if (force_warpspeed_for_determinism && arch >= ::cuda::arch_id::sm_90)
+    // SM80+ determinism path: warpspeed is safe (static scheduling avoids cluster-launch-control;
+    // load/store paths fall back to cp.async + cooperative st.global on SM<90).
+    if (force_warpspeed_for_determinism && arch >= ::cuda::arch_id::sm_80)
     {
       return get_sm100_fallback_warpspeed_policy();
     }

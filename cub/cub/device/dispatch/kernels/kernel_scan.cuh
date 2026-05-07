@@ -203,10 +203,11 @@ __launch_bounds__(device_scan_launch_bounds<PolicySelector>, 1) _CCCL_KERNEL_ATT
   if constexpr (active_policy.algorithm == scan_algorithm::warpspeed)
   {
 #if _CCCL_CUDACC_AT_LEAST(12, 8)
-    // Det path runs on SM90+ (static scheduling); non-det needs SM100 (cluster-launch-control).
+    // Det path runs on SM80+ (static scheduling, cp.async fallback for load/store on SM<90);
+    // non-det needs SM100 (cluster-launch-control).
     if constexpr (RunToRunDeterministic)
     {
-      NV_IF_TARGET(NV_PROVIDES_SM_90, ({
+      NV_IF_TARGET(NV_PROVIDES_SM_80, ({
                      auto scan_params =
                        scanKernelParams<it_value_t<InputIteratorT>, it_value_t<OutputIteratorT>, AccumT>{
                          d_in, d_out, tile_state.lookahead, num_items, num_stages};

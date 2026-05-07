@@ -7,9 +7,9 @@
 #  warning "This benchmark does not support being compiled for multiple architectures. Disabling it."
 #else // _CCCL_PP_COUNT(__CUDA_ARCH_LIST__) != 1
 
-#  if __CUDA_ARCH_LIST__ < 900
-#    warning "Warpspeed deterministic scan requires at least sm_90. Disabling it."
-#  else // __CUDA_ARCH_LIST__ >= 900
+#  if __CUDA_ARCH_LIST__ < 800
+#    warning "Warpspeed deterministic scan requires at least sm_80. Disabling it."
+#  else // __CUDA_ARCH_LIST__ >= 800
 
 #    if __cccl_ptx_isa < 860
 #      warning "Warpspeed deterministic scan requires at least PTX ISA 8.6. Disabling it."
@@ -126,5 +126,5 @@ NVBENCH_BENCH_TYPES(exclusive_scan, NVBENCH_TYPE_AXES(types, offsets))
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4));
 
 #    endif // __cccl_ptx_isa >= 860
-#  endif // __CUDA_ARCH_LIST__ >= 900
+#  endif // __CUDA_ARCH_LIST__ >= 800
 #endif // _CCCL_PP_COUNT(__CUDA_ARCH_LIST__) == 1

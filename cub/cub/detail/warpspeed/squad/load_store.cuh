@@ -15,13 +15,16 @@
 #include <cub/detail/warpspeed/resource/smem_ref.cuh>
 #include <cub/detail/warpspeed/squad/squad.cuh>
 
+#include <cuda/__memcpy_async/cp_async_shared_global.h>
 #include <cuda/__memory/align_down.h>
 #include <cuda/__memory/align_up.h>
 #include <cuda/__ptx/instructions/cp_async_bulk.h>
 #include <cuda/__ptx/instructions/cp_async_bulk_commit_group.h>
 #include <cuda/__ptx/instructions/cp_async_bulk_wait_group.h>
+#include <cuda/__ptx/instructions/cp_async_mbarrier_arrive.h>
 #include <cuda/__ptx/instructions/elect_sync.h>
 #include <cuda/__ptx/instructions/fence.h>
+#include <cuda/__ptx/instructions/mbarrier_arrive.h>
 #include <cuda/std/__type_traits/make_nbit_int.h>
 #include <cuda/std/cstdint>
 
@@ -105,101 +108,184 @@ _CCCL_DEVICE_API void squadLoadBulk(Squad squad, SmemRef<ResourceTp>& refDestSme
   if constexpr (alignof(Tp) >= 16)
   {
     // for alignments larger than 16, we can just bulk copy, even just a single element
-    if (squad.isLeaderThread())
-    {
-      ::cuda::ptx::cp_async_bulk(
-        ::cuda::std::conditional_t<__cccl_ptx_isa >= 860, ::cuda::ptx::space_shared_t, ::cuda::ptx::space_cluster_t>{},
-        ::cuda::ptx::space_global,
-        ptrSmem,
-        cpAsyncOobInfo.ptrGmem,
-        cpAsyncOobInfo.origCopySizeBytes,
-        ptrBar);
-    }
-    refDestSmem.squadIncreaseTxCount(squad, cpAsyncOobInfo.underCopySizeBytes);
+    NV_IF_ELSE_TARGET(
+      NV_PROVIDES_SM_90,
+      ({
+        if (squad.isLeaderThread())
+        {
+          ::cuda::ptx::cp_async_bulk(
+            ::cuda::std::
+              conditional_t<__cccl_ptx_isa >= 860, ::cuda::ptx::space_shared_t, ::cuda::ptx::space_cluster_t>{},
+            ::cuda::ptx::space_global,
+            ptrSmem,
+            cpAsyncOobInfo.ptrGmem,
+            cpAsyncOobInfo.origCopySizeBytes,
+            ptrBar);
+        }
+      }),
+      ({
+        // alignof(Tp) >= 16 is dead code for deterministic scan (only float/double,
+        // both alignof < 16). SM80 port intentionally does not implement this branch.
+        _CCCL_ASSERT(false, "warpspeed SM80: alignof(Tp) >= 16 path not requried, as its only used with fp32/fp64");
+        (void) ptrSmem;
+        (void) ptrBar;
+      }));
+    NV_IF_TARGET(NV_PROVIDES_SM_90, (refDestSmem.squadIncreaseTxCount(squad, cpAsyncOobInfo.underCopySizeBytes);));
   }
   else
   {
+    NV_IF_ELSE_TARGET(
+      NV_PROVIDES_SM_90,
+      ({
     // for alignments smaller than 16, we can overcopy but need to declare the ignored bytes left and right
 #  if __cccl_ptx_isa >= 920
-    if (squad.isLeaderThread())
-    {
-      ::cuda::ptx::cp_async_bulk_ignore_oob(
-        ::cuda::ptx::space_shared,
-        ::cuda::ptx::space_global,
-        ptrSmem,
-        cpAsyncOobInfo.ptrGmemStartAlignDown,
-        cpAsyncOobInfo.overCopySizeBytes,
-        /* ignore left */ cpAsyncOobInfo.smemStartSkipBytes,
-        /* ignore right */ cpAsyncOobInfo.ptrGmemEndAlignUp - cpAsyncOobInfo.ptrGmemEnd,
-        ptrBar);
-    }
-    refDestSmem.squadIncreaseTxCount(squad, cpAsyncOobInfo.overCopySizeBytes);
+        if (squad.isLeaderThread())
+        {
+          ::cuda::ptx::cp_async_bulk_ignore_oob(
+            ::cuda::ptx::space_shared,
+            ::cuda::ptx::space_global,
+            ptrSmem,
+            cpAsyncOobInfo.ptrGmemStartAlignDown,
+            cpAsyncOobInfo.overCopySizeBytes,
+            /* ignore left */ cpAsyncOobInfo.smemStartSkipBytes,
+            /* ignore right */ cpAsyncOobInfo.ptrGmemEndAlignUp - cpAsyncOobInfo.ptrGmemEnd,
+            ptrBar);
+        }
+        refDestSmem.squadIncreaseTxCount(squad, cpAsyncOobInfo.overCopySizeBytes);
 #  else // __cccl_ptx_isa >= 920
-    // if we don't have cp_async_bulk_ignore_oob, we have to undercopy and copy head and tail elements manually
+        // if we don't have cp_async_bulk_ignore_oob, we have to undercopy and copy head and tail elements manually
 
-    // handle small copies first. If we have less than 16 bytes we may not straddle a 16B boundary
-    if (cpAsyncOobInfo.origCopySizeBytes < 16)
-    {
-      const auto elemCount = cpAsyncOobInfo.origCopySizeBytes / sizeof(Tp);
-      _CCCL_ASSERT(elemCount <= squad.threadCount(), "");
-      if (squad.threadRank() < elemCount)
-      {
-        reinterpret_cast<Tp*>(ptrSmem + cpAsyncOobInfo.smemStartSkipBytes)[squad.threadRank()] =
-          reinterpret_cast<const Tp*>(cpAsyncOobInfo.ptrGmem)[squad.threadRank()];
-      }
-      return; // no bulk copy has been performed so we don't need to update the tx count of any barrier
-    }
+        // handle small copies first. If we have less than 16 bytes we may not straddle a 16B boundary
+        if (cpAsyncOobInfo.origCopySizeBytes < 16)
+        {
+          const auto elemCount = cpAsyncOobInfo.origCopySizeBytes / sizeof(Tp);
+          _CCCL_ASSERT(elemCount <= squad.threadCount(), "");
+          if (squad.threadRank() < elemCount)
+          {
+            reinterpret_cast<Tp*>(ptrSmem + cpAsyncOobInfo.smemStartSkipBytes)[squad.threadRank()] =
+              reinterpret_cast<const Tp*>(cpAsyncOobInfo.ptrGmem)[squad.threadRank()];
+          }
+          return; // no bulk copy has been performed so we don't need to update the tx count of any barrier
+        }
 
-    // copies larger than 16 byte which straddle at least one 16B boundary, so we have dedicated start and end copies
+        // copies larger than 16 byte which straddle at least one 16B boundary, so we have dedicated start and end
+        // copies
 
-    const bool doStartCopy = cpAsyncOobInfo.smemStartSkipBytes > 0;
+        const bool doStartCopy = cpAsyncOobInfo.smemStartSkipBytes > 0;
 
-    ::cuda::std::byte* ptrSmemMiddle = ptrSmem;
-    if (doStartCopy)
-    {
-      ptrSmemMiddle += 16;
-    }
+        ::cuda::std::byte* ptrSmemMiddle = ptrSmem;
+        if (doStartCopy)
+        {
+          ptrSmemMiddle += 16;
+        }
 
-    // TODO(bgruber): we could skip the middle if underCopySizeBytes is zero
-    if (squad.isLeaderThread())
-    {
-      ::cuda::ptx::cp_async_bulk(
-        ::cuda::std::conditional_t<__cccl_ptx_isa >= 860, ::cuda::ptx::space_shared_t, ::cuda::ptx::space_cluster_t>{},
-        ::cuda::ptx::space_global,
-        ptrSmemMiddle,
-        cpAsyncOobInfo.ptrGmemStartAlignUp,
-        cpAsyncOobInfo.underCopySizeBytes,
-        ptrBar);
-    }
-    refDestSmem.squadIncreaseTxCount(squad, cpAsyncOobInfo.underCopySizeBytes);
+        // TODO(bgruber): we could skip the middle if underCopySizeBytes is zero
+        if (squad.isLeaderThread())
+        {
+          ::cuda::ptx::cp_async_bulk(
+            ::cuda::std::
+              conditional_t<__cccl_ptx_isa >= 860, ::cuda::ptx::space_shared_t, ::cuda::ptx::space_cluster_t>{},
+            ::cuda::ptx::space_global,
+            ptrSmemMiddle,
+            cpAsyncOobInfo.ptrGmemStartAlignUp,
+            cpAsyncOobInfo.underCopySizeBytes,
+            ptrBar);
+        }
+        refDestSmem.squadIncreaseTxCount(squad, cpAsyncOobInfo.underCopySizeBytes);
 
-    // we cannot use Tp to load the head and tail elements, because sizeof(Tp) may be larger than alignof(Tp)
-    using load_word_t = ::cuda::std::__make_nbit_uint_t<alignof(Tp) * CHAR_BIT>;
+        // we cannot use Tp to load the head and tail elements, because sizeof(Tp) may be larger than alignof(Tp)
+        using load_word_t = ::cuda::std::__make_nbit_uint_t<alignof(Tp) * CHAR_BIT>;
 
-    const int head_elements = (cpAsyncOobInfo.ptrGmemStartAlignUp - cpAsyncOobInfo.ptrGmem) / sizeof(load_word_t);
-    const int tail_elements = (cpAsyncOobInfo.ptrGmemEnd - cpAsyncOobInfo.ptrGmemEndAlignDown) / sizeof(load_word_t);
-    _CCCL_ASSERT(head_elements <= squad.threadCount(), "");
-    _CCCL_ASSERT(tail_elements <= squad.threadCount(), "");
-    load_word_t head_value, tail_value;
-    if (squad.threadRank() < head_elements)
-    {
-      head_value = reinterpret_cast<const load_word_t*>(cpAsyncOobInfo.ptrGmem)[squad.threadRank()];
-    }
-    if (squad.threadRank() < tail_elements)
-    {
-      tail_value = reinterpret_cast<const load_word_t*>(cpAsyncOobInfo.ptrGmemEndAlignDown)[squad.threadRank()];
-    }
+        const int head_elements = (cpAsyncOobInfo.ptrGmemStartAlignUp - cpAsyncOobInfo.ptrGmem) / sizeof(load_word_t);
+        const int tail_elements = (cpAsyncOobInfo.ptrGmemEnd - cpAsyncOobInfo.ptrGmemEndAlignDown) / sizeof(load_word_t);
+        _CCCL_ASSERT(head_elements <= squad.threadCount(), "");
+        _CCCL_ASSERT(tail_elements <= squad.threadCount(), "");
+        load_word_t head_value, tail_value;
+        if (squad.threadRank() < head_elements)
+        {
+          head_value = reinterpret_cast<const load_word_t*>(cpAsyncOobInfo.ptrGmem)[squad.threadRank()];
+        }
+        if (squad.threadRank() < tail_elements)
+        {
+          tail_value = reinterpret_cast<const load_word_t*>(cpAsyncOobInfo.ptrGmemEndAlignDown)[squad.threadRank()];
+        }
 
-    if (squad.threadRank() < head_elements)
-    {
-      reinterpret_cast<load_word_t*>(ptrSmem + cpAsyncOobInfo.smemStartSkipBytes)[squad.threadRank()] = head_value;
-    }
-    if (squad.threadRank() < tail_elements)
-    {
-      reinterpret_cast<load_word_t*>(ptrSmemMiddle + cpAsyncOobInfo.underCopySizeBytes)[squad.threadRank()] =
-        tail_value;
-    }
+        if (squad.threadRank() < head_elements)
+        {
+          reinterpret_cast<load_word_t*>(ptrSmem + cpAsyncOobInfo.smemStartSkipBytes)[squad.threadRank()] = head_value;
+        }
+        if (squad.threadRank() < tail_elements)
+        {
+          reinterpret_cast<load_word_t*>(ptrSmemMiddle + cpAsyncOobInfo.underCopySizeBytes)[squad.threadRank()] =
+            tail_value;
+        }
 #  endif // __cccl_ptx_isa >= 920
+      }),
+      ({
+        // SM80 path: cooperative cp.async middle + manual head/tail (synchronous), arrive via cp_async_mbarrier_arrive
+
+        if (cpAsyncOobInfo.origCopySizeBytes < 16)
+        {
+          const auto elemCount = cpAsyncOobInfo.origCopySizeBytes / sizeof(Tp);
+          _CCCL_ASSERT(elemCount <= squad.threadCount(), "");
+          if (squad.threadRank() < elemCount)
+          {
+            reinterpret_cast<Tp*>(ptrSmem + cpAsyncOobInfo.smemStartSkipBytes)[squad.threadRank()] =
+              reinterpret_cast<const Tp*>(cpAsyncOobInfo.ptrGmem)[squad.threadRank()];
+          }
+          return;
+        }
+
+        const bool doStartCopy = cpAsyncOobInfo.smemStartSkipBytes > 0;
+
+        ::cuda::std::byte* ptrSmemMiddle = ptrSmem;
+        if (doStartCopy)
+        {
+          ptrSmemMiddle += 16;
+        }
+
+        // Cooperative 16B cp.async covering [ptrGmemStartAlignUp, ptrGmemEndAlignDown).
+        const ::cuda::std::uint32_t middleBytes = cpAsyncOobInfo.underCopySizeBytes;
+        const int rank                          = squad.threadRank();
+        const int stride                        = squad.threadCount() * 16;
+        for (::cuda::std::uint32_t off = static_cast<::cuda::std::uint32_t>(rank) * 16u; off < middleBytes;
+             off += static_cast<::cuda::std::uint32_t>(stride))
+        {
+          ::cuda::__cp_async_shared_global<16>(reinterpret_cast<char*>(ptrSmemMiddle + off),
+                                               reinterpret_cast<const char*>(cpAsyncOobInfo.ptrGmemStartAlignUp + off));
+        }
+
+        // Manual head/tail (synchronous regular ld/st).
+        using load_word_t = ::cuda::std::__make_nbit_uint_t<alignof(Tp) * CHAR_BIT>;
+
+        const int head_elements = (cpAsyncOobInfo.ptrGmemStartAlignUp - cpAsyncOobInfo.ptrGmem) / sizeof(load_word_t);
+        const int tail_elements =
+          (cpAsyncOobInfo.ptrGmemEnd - cpAsyncOobInfo.ptrGmemEndAlignDown) / sizeof(load_word_t);
+        _CCCL_ASSERT(head_elements <= squad.threadCount(), "");
+        _CCCL_ASSERT(tail_elements <= squad.threadCount(), "");
+        load_word_t head_value, tail_value;
+        if (squad.threadRank() < head_elements)
+        {
+          head_value = reinterpret_cast<const load_word_t*>(cpAsyncOobInfo.ptrGmem)[squad.threadRank()];
+        }
+        if (squad.threadRank() < tail_elements)
+        {
+          tail_value = reinterpret_cast<const load_word_t*>(cpAsyncOobInfo.ptrGmemEndAlignDown)[squad.threadRank()];
+        }
+        if (squad.threadRank() < head_elements)
+        {
+          reinterpret_cast<load_word_t*>(ptrSmem + cpAsyncOobInfo.smemStartSkipBytes)[squad.threadRank()] = head_value;
+        }
+        if (squad.threadRank() < tail_elements)
+        {
+          reinterpret_cast<load_word_t*>(ptrSmemMiddle + cpAsyncOobInfo.underCopySizeBytes)[squad.threadRank()] =
+            tail_value;
+        }
+
+        // SM80: drain synchronously; SmemRef dtor's release() does the arrive.
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_all;");
+      }));
   }
 }
 
@@ -218,141 +304,209 @@ squadStoreBulkSync(Squad squad, CpAsyncOobInfo<OutputT> cpAsyncOobInfo, const ::
   // - One copy for the first up to 15 bytes at the start of the region.
   // - One copy that starts at a 16-byte aligned address and ends at the latest 16-byte aligned address.
   // - One copy that cleans up the last up to 15 bytes.
-  if (squad.isLeaderWarp())
-  {
-    // Acquire shared memory in async proxy
-    // Perform fence.proxy.async with full warp to avoid BSSY+BSYNC
-    ::cuda::ptx::fence_proxy_async(::cuda::ptx::space_shared);
+  NV_IF_ELSE_TARGET(
+    NV_PROVIDES_SM_90,
+    ({
+      if (squad.isLeaderWarp())
+      {
+        // Acquire shared memory in async proxy
+        // Perform fence.proxy.async with full warp to avoid BSSY+BSYNC
+        ::cuda::ptx::fence_proxy_async(::cuda::ptx::space_shared);
 
 #  if _CCCL_CUDA_COMPILER(NVCC, <, 13, 3)
-    // for some reason the optimizer propagates some information from the computation of
-    // overCopySizeBytes to the masked bulk copy below and generates an unaligned access error.
-    // The artificial read modification of overCopySizeBytes prevents the propagation here works around this.
-    // It also solves the issue described in nvbug 5848313 by accident on nvcc 13.2+
-    asm volatile("" : "+r"(cpAsyncOobInfo.overCopySizeBytes));
+        // for some reason the optimizer propagates some information from the computation of
+        // overCopySizeBytes to the masked bulk copy below and generates an unaligned access error.
+        // The artificial read modification of overCopySizeBytes prevents the propagation here works around this.
+        // It also solves the issue described in nvbug 5848313 by accident on nvcc 13.2+
+        asm volatile("" : "+r"(cpAsyncOobInfo.overCopySizeBytes));
 #  endif // _CCCL_CUDA_COMPILER(NVCC, <, 13, 3)
 
-    const bool doStartCopy  = cpAsyncOobInfo.smemStartSkipBytes > 0;
-    const bool doEndCopy    = cpAsyncOobInfo.smemEndBytesAfter16BBoundary > 0;
-    const bool doMiddleCopy = cpAsyncOobInfo.ptrGmemStartAlignUp != cpAsyncOobInfo.ptrGmemEndAlignUp;
+        const bool doStartCopy  = cpAsyncOobInfo.smemStartSkipBytes > 0;
+        const bool doEndCopy    = cpAsyncOobInfo.smemEndBytesAfter16BBoundary > 0;
+        const bool doMiddleCopy = cpAsyncOobInfo.ptrGmemStartAlignUp != cpAsyncOobInfo.ptrGmemEndAlignUp;
 
-    constexpr ::cuda::std::uint16_t byteMask  = 0xFFFF;
-    const ::cuda::std::uint16_t byteMaskStart = byteMask << cpAsyncOobInfo.smemStartSkipBytes;
-    const ::cuda::std::uint16_t byteMaskEnd   = byteMask >> (16 - cpAsyncOobInfo.smemEndBytesAfter16BBoundary) % 16;
-    // byteMaskStart contains zeroes at the left
+        constexpr ::cuda::std::uint16_t byteMask  = 0xFFFF;
+        const ::cuda::std::uint16_t byteMaskStart = byteMask << cpAsyncOobInfo.smemStartSkipBytes;
+        const ::cuda::std::uint16_t byteMaskEnd   = byteMask >> (16 - cpAsyncOobInfo.smemEndBytesAfter16BBoundary) % 16;
+      // byteMaskStart contains zeroes at the left
 #  if _CCCL_CUDA_COMPILER(NVCC, >=, 13, 2)
-    const ::cuda::std::uint16_t byteMaskSmall = byteMaskStart & byteMaskEnd;
+        const ::cuda::std::uint16_t byteMaskSmall = byteMaskStart & byteMaskEnd;
 #  else // _CCCL_CUDA_COMPILER(NVCC, >=, 13, 2)
     // `ptxas fatal   : (C7907) Internal compiler error`, see nvbug 5848313
     const ::cuda::std::uint16_t byteMaskSmall =
       byteMaskStart & (byteMask >> (16 - (cpAsyncOobInfo.ptrGmemEnd - cpAsyncOobInfo.ptrGmemStartAlignDown)));
 #  endif // _CCCL_CUDA_COMPILER(NVCC, >=, 13, 2)
 
-    const ::cuda::std::byte* ptrSmemMiddle = srcSmem;
-    if (doStartCopy)
-    {
-      ptrSmemMiddle += 16;
-    }
+        const ::cuda::std::byte* ptrSmemMiddle = srcSmem;
+        if (doStartCopy)
+        {
+          ptrSmemMiddle += 16;
+        }
 
-    if (doMiddleCopy)
-    {
-      // Copy the middle part. Starting at byte 0 or 16 in shared memory. This
-      // is the large copy. We perform this one first, so that the compiler can
-      // (hopefully) hide all the arithmetic behind this instruction.
-      if (::cuda::ptx::elect_sync(~0))
-      {
-        ::cuda::ptx::cp_async_bulk(
-          ::cuda::ptx::space_global,
-          ::cuda::ptx::space_shared,
-          cpAsyncOobInfo.ptrGmemStartAlignUp,
-          ptrSmemMiddle,
-          cpAsyncOobInfo.underCopySizeBytes);
-      }
-      if (doStartCopy)
-      {
-        // cp.async.bulk.cp_mask is SM100-only; SM90 falls back to scalar per-thread byte stores.
-        NV_IF_ELSE_TARGET(
-          NV_PROVIDES_SM_100,
-          ({
-            if (::cuda::ptx::elect_sync(~0))
-            {
-              ::cuda::ptx::cp_async_bulk_cp_mask(
-                ::cuda::ptx::space_global,
-                ::cuda::ptx::space_shared,
-                cpAsyncOobInfo.ptrGmemStartAlignDown,
-                srcSmem,
-                /*size*/ 16,
-                byteMaskStart);
-            }
-          }),
-          ({
-            const int rank = squad.threadRank();
-            if (rank < 16 && ((byteMaskStart >> rank) & 1u))
-            {
-              reinterpret_cast<::cuda::std::byte*>(cpAsyncOobInfo.ptrGmemStartAlignDown)[rank] = srcSmem[rank];
-            }
-          }));
-      }
-      if (doEndCopy)
-      {
-#  if _CCCL_CUDA_COMPILER(NVHPC)
-        // nvc++ seems to have an optimizer bug, crashing with an unaligned access error below. The addresses are fine
-        // when printed, so let's shake the optimizer a bit.
-        asm volatile("" : "+l"(cpAsyncOobInfo.ptrGmemEndAlignDown));
-#  endif // _CCCL_CUDA_COMPILER(NVHPC)
-
-        NV_IF_ELSE_TARGET(
-          NV_PROVIDES_SM_100,
-          ({
-            if (::cuda::ptx::elect_sync(~0))
-            {
-              ::cuda::ptx::cp_async_bulk_cp_mask(
-                ::cuda::ptx::space_global,
-                ::cuda::ptx::space_shared,
-                cpAsyncOobInfo.ptrGmemEndAlignDown,
-                ptrSmemMiddle + cpAsyncOobInfo.underCopySizeBytes,
-                /*size*/ 16,
-                byteMaskEnd);
-            }
-          }),
-          ({
-            const int rank                            = squad.threadRank();
-            const ::cuda::std::byte* tail_smem_source = ptrSmemMiddle + cpAsyncOobInfo.underCopySizeBytes;
-            if (rank < 16 && ((byteMaskEnd >> rank) & 1u))
-            {
-              reinterpret_cast<::cuda::std::byte*>(cpAsyncOobInfo.ptrGmemEndAlignDown)[rank] = tail_smem_source[rank];
-            }
-          }));
-      }
-    }
-    else
-    {
-      NV_IF_ELSE_TARGET(
-        NV_PROVIDES_SM_100,
-        ({
+        if (doMiddleCopy)
+        {
+          // Copy the middle part. Starting at byte 0 or 16 in shared memory. This
+          // is the large copy. We perform this one first, so that the compiler can
+          // (hopefully) hide all the arithmetic behind this instruction.
           if (::cuda::ptx::elect_sync(~0))
           {
-            ::cuda::ptx::cp_async_bulk_cp_mask(
+            ::cuda::ptx::cp_async_bulk(
               ::cuda::ptx::space_global,
               ::cuda::ptx::space_shared,
-              cpAsyncOobInfo.ptrGmemStartAlignDown,
-              srcSmem,
-              /*size*/ 16,
-              byteMaskSmall);
+              cpAsyncOobInfo.ptrGmemStartAlignUp,
+              ptrSmemMiddle,
+              cpAsyncOobInfo.underCopySizeBytes);
           }
-        }),
-        ({
+          if (doStartCopy)
+          {
+            // cp.async.bulk.cp_mask is SM100-only; SM90 falls back to scalar per-thread byte stores.
+            NV_IF_ELSE_TARGET(
+              NV_PROVIDES_SM_100,
+              ({
+                if (::cuda::ptx::elect_sync(~0))
+                {
+                  ::cuda::ptx::cp_async_bulk_cp_mask(
+                    ::cuda::ptx::space_global,
+                    ::cuda::ptx::space_shared,
+                    cpAsyncOobInfo.ptrGmemStartAlignDown,
+                    srcSmem,
+                    /*size*/ 16,
+                    byteMaskStart);
+                }
+              }),
+              ({
+                const int rank = squad.threadRank();
+                if (rank < 16 && ((byteMaskStart >> rank) & 1u))
+                {
+                  reinterpret_cast<::cuda::std::byte*>(cpAsyncOobInfo.ptrGmemStartAlignDown)[rank] = srcSmem[rank];
+                }
+              }));
+          }
+          if (doEndCopy)
+          {
+#  if _CCCL_CUDA_COMPILER(NVHPC)
+            // nvc++ seems to have an optimizer bug, crashing with an unaligned access error below. The addresses are
+            // fine when printed, so let's shake the optimizer a bit.
+            asm volatile("" : "+l"(cpAsyncOobInfo.ptrGmemEndAlignDown));
+#  endif // _CCCL_CUDA_COMPILER(NVHPC)
+
+            NV_IF_ELSE_TARGET(
+              NV_PROVIDES_SM_100,
+              ({
+                if (::cuda::ptx::elect_sync(~0))
+                {
+                  ::cuda::ptx::cp_async_bulk_cp_mask(
+                    ::cuda::ptx::space_global,
+                    ::cuda::ptx::space_shared,
+                    cpAsyncOobInfo.ptrGmemEndAlignDown,
+                    ptrSmemMiddle + cpAsyncOobInfo.underCopySizeBytes,
+                    /*size*/ 16,
+                    byteMaskEnd);
+                }
+              }),
+              ({
+                const int rank                            = squad.threadRank();
+                const ::cuda::std::byte* tail_smem_source = ptrSmemMiddle + cpAsyncOobInfo.underCopySizeBytes;
+                if (rank < 16 && ((byteMaskEnd >> rank) & 1u))
+                {
+                  reinterpret_cast<::cuda::std::byte*>(cpAsyncOobInfo.ptrGmemEndAlignDown)[rank] =
+                    tail_smem_source[rank];
+                }
+              }));
+          }
+        }
+        else
+        {
+          NV_IF_ELSE_TARGET(
+            NV_PROVIDES_SM_100,
+            ({
+              if (::cuda::ptx::elect_sync(~0))
+              {
+                ::cuda::ptx::cp_async_bulk_cp_mask(
+                  ::cuda::ptx::space_global,
+                  ::cuda::ptx::space_shared,
+                  cpAsyncOobInfo.ptrGmemStartAlignDown,
+                  srcSmem,
+                  /*size*/ 16,
+                  byteMaskSmall);
+              }
+            }),
+            ({
+              const int rank = squad.threadRank();
+              if (rank < 16 && ((byteMaskSmall >> rank) & 1u))
+              {
+                reinterpret_cast<::cuda::std::byte*>(cpAsyncOobInfo.ptrGmemStartAlignDown)[rank] = srcSmem[rank];
+              }
+            }));
+        }
+        // Commit and wait for store to have completed reading from shared memory
+        ::cuda::ptx::cp_async_bulk_commit_group();
+        ::cuda::ptx::cp_async_bulk_wait_group_read(::cuda::ptx::n32_t<0>{});
+      }
+    }),
+    ({
+      // SM80 cooperative store path. Whole squad does aligned 16B vector stores for the middle;
+      // leader warp does byte-mask head/tail. Output srcSmem buffer was filled by the prior
+      // squadStoreSmem and made visible CTA-wide by the squad.syncThreads() at the call site.
+      const bool doStartCopy  = cpAsyncOobInfo.smemStartSkipBytes > 0;
+      const bool doEndCopy    = cpAsyncOobInfo.smemEndBytesAfter16BBoundary > 0;
+      const bool doMiddleCopy = cpAsyncOobInfo.ptrGmemStartAlignUp != cpAsyncOobInfo.ptrGmemEndAlignUp;
+
+      constexpr ::cuda::std::uint16_t byteMask  = 0xFFFF;
+      const ::cuda::std::uint16_t byteMaskStart = byteMask << cpAsyncOobInfo.smemStartSkipBytes;
+      const ::cuda::std::uint16_t byteMaskEnd   = byteMask >> (16 - cpAsyncOobInfo.smemEndBytesAfter16BBoundary) % 16;
+      const ::cuda::std::uint16_t byteMaskSmall = byteMaskStart & byteMaskEnd;
+
+      const ::cuda::std::byte* ptrSmemMiddle = srcSmem;
+      if (doStartCopy)
+      {
+        ptrSmemMiddle += 16;
+      }
+
+      if (doMiddleCopy)
+      {
+        // Cooperative 16B vector stores by the entire squad. ptrSmemMiddle is 16B aligned by
+        // construction; ptrGmemStartAlignUp is 16B aligned by definition.
+        const ::cuda::std::uint32_t middleBytes = cpAsyncOobInfo.underCopySizeBytes;
+        const int rank                          = squad.threadRank();
+        const int stride                        = squad.threadCount() * 16;
+        for (::cuda::std::uint32_t off = static_cast<::cuda::std::uint32_t>(rank) * 16u; off < middleBytes;
+             off += static_cast<::cuda::std::uint32_t>(stride))
+        {
+          const uint4 v = *reinterpret_cast<const uint4*>(ptrSmemMiddle + off);
+          *reinterpret_cast<uint4*>(cpAsyncOobInfo.ptrGmemStartAlignUp + off) = v;
+        }
+
+        // Head/tail byte stores: leader warp only (only 16 lanes write, so no point fanning out).
+        if (squad.isLeaderWarp())
+        {
+          const int rank = squad.threadRank();
+          if (doStartCopy && rank < 16 && ((byteMaskStart >> rank) & 1u))
+          {
+            reinterpret_cast<::cuda::std::byte*>(cpAsyncOobInfo.ptrGmemStartAlignDown)[rank] = srcSmem[rank];
+          }
+          if (doEndCopy && rank < 16 && ((byteMaskEnd >> rank) & 1u))
+          {
+            const ::cuda::std::byte* tail_smem_source = ptrSmemMiddle + cpAsyncOobInfo.underCopySizeBytes;
+            reinterpret_cast<::cuda::std::byte*>(cpAsyncOobInfo.ptrGmemEndAlignDown)[rank] = tail_smem_source[rank];
+          }
+        }
+      }
+      else
+      {
+        // Whole output fits inside a single 16B aligned region; byte-mask within the leader warp.
+        if (squad.isLeaderWarp())
+        {
           const int rank = squad.threadRank();
           if (rank < 16 && ((byteMaskSmall >> rank) & 1u))
           {
             reinterpret_cast<::cuda::std::byte*>(cpAsyncOobInfo.ptrGmemStartAlignDown)[rank] = srcSmem[rank];
           }
-        }));
-    }
-    // Commit and wait for store to have completed reading from shared memory
-    ::cuda::ptx::cp_async_bulk_commit_group();
-    ::cuda::ptx::cp_async_bulk_wait_group_read(::cuda::ptx::n32_t<0>{});
-  }
+        }
+      }
+      // No commit/wait needed: regular st.global is synchronous from the issuing thread; cross-CTA
+      // visibility is handled by L2.
+    }));
 }
 
 #endif // __cccl_ptx_isa >= 860

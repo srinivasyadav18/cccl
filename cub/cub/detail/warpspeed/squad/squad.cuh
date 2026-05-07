@@ -40,7 +40,9 @@ struct Squad : SquadDesc
       : SquadDesc(squadStatic)
       , mSpecialRegisters(specialRegisters)
   {
-    mIsWarpLeader = ::cuda::ptx::elect_sync(~0);
+    NV_IF_ELSE_TARGET(NV_PROVIDES_SM_90,
+                      (mIsWarpLeader = ::cuda::ptx::elect_sync(~0);),
+                      (mIsWarpLeader = (mSpecialRegisters.laneIdx == 0);));
     mIsLeaderWarp = warpRank() == 0;
   }
 
