@@ -271,7 +271,8 @@ template <typename PolicySelector,
           typename AccumT,
           typename ScanOpT,
           typename RealInitValueT,
-          bool ForceInclusive>
+          bool ForceInclusive,
+          bool RunToRunDeterministic = false>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
   warpspeed::Squad squad,
   warpspeed::SpecialRegisters specialRegisters,
@@ -498,14 +499,13 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
 
       if (!is_first_tile)
       {
-        AccumT regSumExclusiveCta = warpspeed::warpIncrementalLookback<look_ahead_items_per_thread>(
-          specialRegisters, params.ptrTileStates, idxTilePrev, sumExclusiveCtaPrev, idxTile, scan_op);
+        AccumT regSumExclusiveCta =
+          warpspeed::warpIncrementalLookback<RunToRunDeterministic, look_ahead_items_per_thread>(
+            specialRegisters, params.ptrTileStates, idxTilePrev, sumExclusiveCtaPrev, idxTile, scan_op);
         if (squad.isLeaderThread())
         {
           refSumExclusiveCtaW.data() = regSumExclusiveCta;
         }
-        sumExclusiveCtaPrev = regSumExclusiveCta;
-        idxTilePrev         = idxTile;
       }
     }
 
@@ -802,6 +802,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
 template <typename PolicySelector,
           bool ForceInclusive,
           typename RealInitValueT,
+          bool RunToRunDeterministic,
           typename InputT,
           typename OutputT,
           typename AccumT,
@@ -827,7 +828,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_scan_lookahead_body(
 
   // we need to force inline the lambda, but clang in CUDA mode only likes the GNU syntax
   warpspeed::squadDispatch(specialRegisters, scanSquads, [&](warpspeed::Squad squad) _CCCL_FORCEINLINE_LAMBDA {
-    kernelBody<PolicySelector, InputT, OutputT, AccumT, ScanOpT, RealInitValueT, ForceInclusive>(
+    kernelBody<PolicySelector, InputT, OutputT, AccumT, ScanOpT, RealInitValueT, ForceInclusive, RunToRunDeterministic>(
       squad, specialRegisters, params, ::cuda::std::move(scan_op), static_cast<RealInitValueT>(init_value));
   });
 #endif // __cccl_ptx_isa >= 860

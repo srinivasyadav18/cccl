@@ -68,7 +68,8 @@ template <typename PolicySelector,
           typename InitValueT,
           typename OffsetT,
           typename AccumT,
-          ForceInclusive EnforceInclusive>
+          ForceInclusive EnforceInclusive,
+          bool RunToRunDeterministic = false>
 struct DeviceScanKernelSource
 {
   using ScanTileStateT = ScanTileState<AccumT>;
@@ -87,7 +88,8 @@ struct DeviceScanKernelSource
                      InitValueT,
                      OffsetT,
                      AccumT,
-                     EnforceInclusive == ForceInclusive::Yes>)
+                     EnforceInclusive == ForceInclusive::Yes,
+                     RunToRunDeterministic>)
 
   CUB_RUNTIME_FUNCTION static constexpr ::cuda::std::size_t InputSize()
   {
@@ -247,15 +249,17 @@ template <
   ForceInclusive EnforceInclusive = ForceInclusive::No,
   typename PolicyHub              = detail::scan::
     policy_hub<detail::it_value_t<InputIteratorT>, detail::it_value_t<OutputIteratorT>, AccumT, OffsetT, ScanOpT>,
-  typename KernelSource = detail::scan::DeviceScanKernelSource<
-    detail::scan::policy_selector_from_hub<PolicyHub>,
-    THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator_t<InputIteratorT>,
-    THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator_t<OutputIteratorT>,
-    ScanOpT,
-    InitValueT,
-    OffsetT,
-    AccumT,
-    EnforceInclusive>,
+  bool RunToRunDeterministic = false,
+  typename KernelSource      = detail::scan::DeviceScanKernelSource<
+         detail::scan::policy_selector_from_hub<PolicyHub>,
+         THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator_t<InputIteratorT>,
+         THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator_t<OutputIteratorT>,
+         ScanOpT,
+         InitValueT,
+         OffsetT,
+         AccumT,
+         EnforceInclusive,
+         RunToRunDeterministic>,
   typename KernelLauncherFactory = CUB_DETAIL_DEFAULT_KERNEL_LAUNCHER_FACTORY>
 struct DispatchScan
 {
@@ -532,6 +536,7 @@ struct DispatchScan
     {
       return error;
     }
+
     // Maximum dynamic shared memory size that we can use for temporary storage.
     int max_dynamic_smem_size{};
     if (const auto error =
@@ -918,6 +923,7 @@ namespace detail::scan
 {
 template <
   ForceInclusive EnforceInclusive = ForceInclusive::No,
+  bool RunToRunDeterministic      = false,
   typename InputIteratorT,
   typename OutputIteratorT,
   typename ScanOpT,
@@ -937,7 +943,8 @@ template <
       InitValueT,
       OffsetT,
       AccumT,
-      EnforceInclusive>,
+      EnforceInclusive,
+      RunToRunDeterministic>,
   typename KernelLauncherFactory = CUB_DETAIL_DEFAULT_KERNEL_LAUNCHER_FACTORY>
 #if _CCCL_HAS_CONCEPTS()
   requires scan_policy_selector<PolicySelector>
@@ -984,6 +991,7 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE auto dispatch(
                         AccumT,
                         EnforceInclusive,
                         fake_policy,
+                        RunToRunDeterministic,
                         KernelSource,
                         KernelLauncherFactory>{
       d_temp_storage,
@@ -1004,6 +1012,7 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE auto dispatch(
 template <
   typename AccumT,
   ForceInclusive EnforceInclusive = ForceInclusive::No,
+  bool RunToRunDeterministic      = false,
   typename InputIteratorT,
   typename OutputIteratorT,
   typename ScanOpT,
@@ -1018,7 +1027,8 @@ template <
       InitValueT,
       OffsetT,
       AccumT,
-      EnforceInclusive>,
+      EnforceInclusive,
+      RunToRunDeterministic>,
   typename KernelLauncherFactory = CUB_DETAIL_DEFAULT_KERNEL_LAUNCHER_FACTORY>
 CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE auto dispatch_with_accum(
   void* d_temp_storage,
@@ -1033,7 +1043,14 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE auto dispatch_with_accum(
   KernelSource kernel_source             = {},
   KernelLauncherFactory launcher_factory = {}) -> cudaError_t
 {
-  return dispatch<EnforceInclusive, InputIteratorT, OutputIteratorT, ScanOpT, InitValueT, OffsetT, AccumT>(
+  return dispatch<EnforceInclusive,
+                  RunToRunDeterministic,
+                  InputIteratorT,
+                  OutputIteratorT,
+                  ScanOpT,
+                  InitValueT,
+                  OffsetT,
+                  AccumT>(
     d_temp_storage,
     temp_storage_bytes,
     d_in,

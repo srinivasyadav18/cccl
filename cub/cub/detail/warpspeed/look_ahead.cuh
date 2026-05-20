@@ -176,19 +176,21 @@ _CCCL_DEVICE_API void warpLoadLookback(
 // The function must be called from a single warp. All passed arguments must be
 // warp-uniform.
 //
-template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
+template <bool RunToRunDeterministic, int numTileStatesPerThread, typename AccumT, typename ScanOpT>
 [[nodiscard]] _CCCL_DEVICE_API _CCCL_FORCEINLINE AccumT warpIncrementalLookback(
   SpecialRegisters specialRegisters,
   tile_state_t<AccumT>* ptrTileStates,
-  const int idxTilePrev,
-  const AccumT sumExclusiveCtaPrev,
+  int& idxTilePrev,
+  AccumT& sumExclusiveCtaPrev,
   const int idxTileNext,
   ScanOpT& scan_op)
 {
   const int laneIdx                      = specialRegisters.laneIdx;
   const ::cuda::std::uint32_t lanemaskEq = ::cuda::ptx::get_sreg_lanemask_eq();
 
-  int idxTileCur            = idxTilePrev;
+  // In deterministic mode, snap the left pointer down to the nearest 32-multiple so anchor batches are
+  // always aligned (the carry contract already guarantees this; the snap is defensive).
+  int idxTileCur            = RunToRunDeterministic ? (idxTilePrev / 32) * 32 : idxTilePrev;
   AccumT sumExclusiveCtaCur = sumExclusiveCtaPrev;
 
   using warp_reduce_t = WarpReduce<AccumT>;
@@ -218,48 +220,83 @@ template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
       // Bitmask with 1 bits for all rightmost lanes having a tile aggregate
       const ::cuda::std::uint32_t warp_right_aggregates_mask = warp_has_aggregate_mask & (~warp_has_aggregate_mask - 1);
 
-      // Cannot reduce if no rightmost tile aggregates
-      if (warp_right_aggregates_mask == 0)
-      {
-        break;
-      }
-
       const ::cuda::std::uint32_t warp_right_aggregates_count = ::cuda::std::popcount(warp_right_aggregates_mask);
 
-      // Accumulate the rightmost tile aggregates
-      AccumT local_sum;
-      NV_IF_ELSE_TARGET(
-        NV_PROVIDES_SM_80,
-        ({ // NOTE: Inlined from warp_reduce_shfl
-          if constexpr (::cuda::std::is_integral_v<AccumT> && sizeof(AccumT) <= sizeof(unsigned)
-                        && (is_cuda_std_plus_v<ScanOpT, AccumT> || is_cuda_minimum_maximum_v<ScanOpT, AccumT>
-                            || is_cuda_std_bitwise_v<ScanOpT, AccumT>) )
-          {
-            const bool use_value = lanemaskEq & warp_right_aggregates_mask;
-            const AccumT value   = use_value ? regTmpStates[idx].value : cuda::identity_element<ScanOpT, AccumT>();
-            local_sum            = reduce_op_sync(value, ~0, scan_op);
-          }
-          else
-          {
-            // TODO(bgruber): this generates a LOT of SASS. I think it can do better.
-            local_sum =
-              warp_reduce_t{temp_storage}.Reduce(regTmpStates[idx].value, scan_op, warp_right_aggregates_count);
-          }
-        }),
-        (local_sum = warp_reduce_t{temp_storage}.Reduce(regTmpStates[idx].value, scan_op, warp_right_aggregates_count);))
-
-      // We never initialized sumExclusiveCtaCur when starting look ahead at tile 0
-      sumExclusiveCtaCur = idxTileCur == 0 ? local_sum : scan_op(sumExclusiveCtaCur, local_sum);
-      idxTileCur += warp_right_aggregates_count;
-
-      // we can only continue on the next 32 tile states, if we consumed all 32 of this iteration
-      if (warp_right_aggregates_count < 32)
+      if constexpr (RunToRunDeterministic)
       {
-        break;
+        // 32 for anchor batches; < 32 only for the final tail batch (size = idxTileNext mod 32).
+        const ::cuda::std::uint32_t expected_count =
+          static_cast<::cuda::std::uint32_t>(::cuda::std::min(32, idxTileNext - idxTileCur));
+        if (warp_right_aggregates_count < expected_count)
+        {
+          break;
+        }
+
+        const bool use_value   = lanemaskEq & warp_right_aggregates_mask;
+        const AccumT value     = use_value ? regTmpStates[idx].value : cuda::identity_element<ScanOpT, AccumT>();
+        const AccumT local_sum = warp_reduce_t{temp_storage}.Reduce(value, scan_op);
+
+        if (expected_count == 32)
+        {
+          // Anchor batch: advance and carry forward.
+          sumExclusiveCtaCur = idxTileCur == 0 ? local_sum : scan_op(sumExclusiveCtaCur, local_sum);
+          idxTileCur += 32;
+        }
+        else
+        {
+          // Tail (last) batch: produce the full prefix but carry only the anchor.
+          const AccumT full_sum = idxTileCur == 0 ? local_sum : scan_op(sumExclusiveCtaCur, local_sum);
+          idxTilePrev           = idxTileCur;
+          sumExclusiveCtaPrev   = sumExclusiveCtaCur;
+          return full_sum;
+        }
+      }
+      else
+      {
+        if (warp_right_aggregates_mask == 0)
+        {
+          break;
+        }
+
+        AccumT local_sum;
+        NV_IF_ELSE_TARGET(
+          NV_PROVIDES_SM_80,
+          ({ // NOTE: Inlined from warp_reduce_shfl
+            if constexpr (::cuda::std::is_integral_v<AccumT> && sizeof(AccumT) <= sizeof(unsigned)
+                          && (is_cuda_std_plus_v<ScanOpT, AccumT> || is_cuda_minimum_maximum_v<ScanOpT, AccumT>
+                              || is_cuda_std_bitwise_v<ScanOpT, AccumT>) )
+            {
+              const bool use_value = lanemaskEq & warp_right_aggregates_mask;
+              const AccumT value   = use_value ? regTmpStates[idx].value : cuda::identity_element<ScanOpT, AccumT>();
+              local_sum            = reduce_op_sync(value, ~0, scan_op);
+            }
+            else
+            {
+              // TODO(bgruber): this generates a LOT of SASS. I think it can do better.
+              local_sum =
+                warp_reduce_t{temp_storage}.Reduce(regTmpStates[idx].value, scan_op, warp_right_aggregates_count);
+            }
+          }),
+          (local_sum =
+             warp_reduce_t{temp_storage}.Reduce(regTmpStates[idx].value, scan_op, warp_right_aggregates_count);))
+
+        // We never initialized sumExclusiveCtaCur when starting look ahead at tile 0
+        sumExclusiveCtaCur = idxTileCur == 0 ? local_sum : scan_op(sumExclusiveCtaCur, local_sum);
+        idxTileCur += warp_right_aggregates_count;
+
+        // we can only continue on the next 32 tile states, if we consumed all 32 of this iteration
+        if (warp_right_aggregates_count < 32)
+        {
+          break;
+        }
       }
     }
   }
 
+  // Reached idxTileNext exactly: in deterministic mode this means idxTileNext was 32-aligned (no tail),
+  // so sumExclusiveCtaCur is the new anchor. In non-deterministic mode it is the full prefix.
+  idxTilePrev         = idxTileNext;
+  sumExclusiveCtaPrev = sumExclusiveCtaCur;
   return sumExclusiveCtaCur; // must only be valid in lane_0
 }
 
