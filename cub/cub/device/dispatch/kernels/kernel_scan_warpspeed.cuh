@@ -62,6 +62,9 @@ struct scanKernelParams
   const InputT* ptrIn;
   OutputT* ptrOut;
   warpspeed::tile_state_t<AccumT>* ptrTileStates;
+  // Atomic work-stealing counter used by the sm_90 path. Unused on sm_100+ where the kernel claims
+  // tiles via clusterlaunchcontrol_try_cancel; may be nullptr in that case.
+  ::cuda::std::uint32_t* atomicCounter;
   ::cuda::std::size_t numElem;
   int numStages;
 };
@@ -132,6 +135,19 @@ _CCCL_DEVICE_API inline void squadGetNextBlockIdx(const warpspeed::Squad& squad,
     ::cuda::ptx::clusterlaunchcontrol_try_cancel(&refDestSmem.data(), refDestSmem.ptrCurBarrierRelease());
   }
   refDestSmem.squadIncreaseTxCount(squad, refDestSmem.sizeBytes());
+}
+
+// sm_90 variant: claim the next tile via atomicAdd on the global counter and stash the result in
+// the first lane of the uint4 SMEM slot (same layout the reader path expects from
+// clusterlaunchcontrol on sm_100+). Barrier signaling for readers happens through the SmemRef
+// destructor's plain mbarrier_arrive — no tx-count manipulation needed.
+_CCCL_DEVICE_API inline void squadGetNextBlockIdxAtomic(
+  const warpspeed::Squad& squad, warpspeed::SmemRef<uint4>& refDestSmem, ::cuda::std::uint32_t* atomicCounter)
+{
+  if (squad.isLeaderThread())
+  {
+    refDestSmem.data().x = ::atomicAdd(atomicCounter, 1u);
+  }
 }
 
 template <typename Tp, typename ScanOpT>
@@ -316,8 +332,19 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
   // Pre-loop
   ////////////////////////////////////////////////////////////////////////////////
 
-  // Start with the tile indicated by blockIdx.x
+  // Total number of tiles in the problem; used as the loop-exit bound on the sm_90 atomic path.
+  const int numTiles = static_cast<int>(::cuda::ceil_div(params.numElem, ::cuda::std::size_t(tile_size)));
+
+  // First tile this CTA processes:
+  //   sm_100+: blockIdx.x (gridDim.x == numTiles; HW cluster scheduler claims the rest).
+  //   sm_90:   blockIdx.x — gridDim.x is sized to min(sm_count, numTiles) so blockIdx.x < numTiles
+  //            for every launched CTA. The atomic counter is pre-initialized by the dispatch to
+  //            gridDim.x, so the loop's first squadSched atomicAdd claims the (gridDim.x)-th tile.
+  //            This avoids a race in which one fast CTA could otherwise consume all tiles via the
+  //            counter before slower CTAs reached their pre-loop, causing them to claim an
+  //            out-of-range starting tile.
   int idxTile = specialRegisters.blockIdxX;
+
   // Lookback-specific variables:
   int idxTilePrev = 0;
   AccumT sumExclusiveCtaPrev; // only valid in squadLookback lane_0
@@ -352,9 +379,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
     {
       ////////////////////////////////////////////////////////////////////////////////
       // Load next tile index
+      //   sm_100+: clusterlaunchcontrol.try_cancel (HW work-stealing)
+      //   sm_90:   atomicAdd on global counter (SW work-stealing)
       ////////////////////////////////////////////////////////////////////////////////
       warpspeed::SmemRef refNextBlockIdxW = phaseNextBlockIdxW.acquireRef();
-      squadGetNextBlockIdx(squad, refNextBlockIdxW);
+      NV_IF_ELSE_TARGET(
+        NV_PROVIDES_SM_100,
+        (squadGetNextBlockIdx(squad, refNextBlockIdxW);),
+        (squadGetNextBlockIdxAtomic(squad, refNextBlockIdxW, params.atomicCounter);))
     }
 
     const ::cuda::std::size_t idxTileBase = idxTile * ::cuda::std::size_t(tile_size);
@@ -383,7 +415,13 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
       regNextBlockIdx                     = refNextBlockIdxR.data();
       refNextBlockIdxR.setFenceLdsToAsyncProxy();
     }
-    bool nextIdxTileValid = ::cuda::ptx::clusterlaunchcontrol_query_cancel_is_canceled(regNextBlockIdx);
+    //   sm_100+: HW cluster scheduler reports "canceled" iff the next tile was claimed for this CTA.
+    //   sm_90:   sched squad stored an atomicAdd result into .x — valid iff in-range.
+    bool nextIdxTileValid = false;
+    NV_IF_ELSE_TARGET(
+      NV_PROVIDES_SM_100,
+      (nextIdxTileValid = ::cuda::ptx::clusterlaunchcontrol_query_cancel_is_canceled(regNextBlockIdx);),
+      (nextIdxTileValid = static_cast<int>(regNextBlockIdx.x) < numTiles;))
 
     if (squad == squadReduce)
     {
@@ -788,7 +826,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void kernelBody(
       break;
     }
     // Update idxTile
-    idxTile = ::cuda::ptx::clusterlaunchcontrol_query_cancel_get_first_ctaid_x<int>(regNextBlockIdx);
+    NV_IF_ELSE_TARGET(
+      NV_PROVIDES_SM_100,
+      (idxTile = ::cuda::ptx::clusterlaunchcontrol_query_cancel_get_first_ctaid_x<int>(regNextBlockIdx);),
+      (idxTile = static_cast<int>(regNextBlockIdx.x);))
   }
 
   if (squad == squadLoad)

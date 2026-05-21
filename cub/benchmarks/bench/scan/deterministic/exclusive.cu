@@ -7,9 +7,9 @@
 #  warning "This benchmark does not support being compiled for multiple architectures. Disabling it."
 #else // _CCCL_PP_COUNT(__CUDA_ARCH_LIST__) != 1
 
-#  if __CUDA_ARCH_LIST__ < 1000
-#    warning "Warpspeed deterministic scan requires at least sm_100. Disabling it."
-#  else // __CUDA_ARCH_LIST__ >= 1000
+#  if __CUDA_ARCH_LIST__ < 900
+#    warning "Warpspeed deterministic scan requires at least sm_90. Disabling it."
+#  else // __CUDA_ARCH_LIST__ >= 900
 
 #    if __cccl_ptx_isa < 860
 #      warning "Warpspeed deterministic scan requires at least PTX ISA 8.6. Disabling it."
@@ -72,20 +72,9 @@ try
   }
   else
   {
+    // Det=0: default hub — warpspeed on SM100+, classic lookback on SM90.
     cub::detail::scan::dispatch_with_accum<T, cub::ForceInclusive::No, false>(
-      nullptr,
-      tmp_size,
-      d_input,
-      d_output,
-      scan_op_t{},
-      init_t{T{}},
-      static_cast<offset_t>(elements),
-      0 /* stream */
-#      if !TUNE_BASE
-      ,
-      policy_selector<T>{}
-#      endif // !TUNE_BASE
-    );
+      nullptr, tmp_size, d_input, d_output, scan_op_t{}, init_t{T{}}, static_cast<offset_t>(elements), 0 /* stream */);
   }
 
   thrust::device_vector<nvbench::uint8_t> tmp(tmp_size);
@@ -118,12 +107,7 @@ try
         scan_op_t{},
         init_t{T{}},
         static_cast<offset_t>(elements),
-        launch.get_stream()
-#      if !TUNE_BASE
-          ,
-        policy_selector<T>{}
-#      endif // !TUNE_BASE
-      );
+        launch.get_stream());
     }
   });
 }
@@ -142,5 +126,5 @@ NVBENCH_BENCH_TYPES(exclusive_scan, NVBENCH_TYPE_AXES(types, offsets))
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4));
 
 #    endif // __cccl_ptx_isa >= 860
-#  endif // __CUDA_ARCH_LIST__ >= 1000
+#  endif // __CUDA_ARCH_LIST__ >= 900
 #endif // _CCCL_PP_COUNT(__CUDA_ARCH_LIST__) == 1

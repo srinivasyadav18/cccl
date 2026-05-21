@@ -72,7 +72,11 @@ _CCCL_DEVICE_API void
 storeTileAggregate(tile_state_t<AccumT>* ptrTileStates, scan_state scanState, AccumT sum, int index)
 {
   _CCCL_ASSERT(::cuda::is_aligned(ptrTileStates, alignof(tile_state_t<AccumT>)), "");
-  _CCCL_ASSERT(index >= 0 && index < gridDim.x, "Reading out of bounds tile state");
+  // On the sm_100+ path gridDim.x == num_tiles, so the original `index < gridDim.x` bound was a
+  // tight check. On the sm_90 atomic-scheduling path gridDim.x can be smaller than num_tiles, so
+  // we relax to a non-negativity check; the dispatch sizes the tile-state buffer to num_tiles and
+  // the kernel's loop already guarantees `idxTile < num_tiles`.
+  _CCCL_ASSERT(index >= 0, "Negative tile state index");
 
   if constexpr (sizeof(tile_state_t<AccumT>) <= cub::detail::warpspeed::max_native_atomic_size()
                 && ::cuda::std::is_trivially_copyable_v<tile_state_t<AccumT>>)
@@ -99,7 +103,11 @@ template <typename AccumT>
 _CCCL_DEVICE_API tile_state_t<AccumT> loadTileAggregate(tile_state_t<AccumT>* ptrTileStates, int index)
 {
   _CCCL_ASSERT(::cuda::is_aligned(ptrTileStates, alignof(tile_state_t<AccumT>)), "");
-  _CCCL_ASSERT(index >= 0 && index < gridDim.x, "Reading out of bounds tile state");
+  // On the sm_100+ path gridDim.x == num_tiles, so the original `index < gridDim.x` bound was a
+  // tight check. On the sm_90 atomic-scheduling path gridDim.x can be smaller than num_tiles, so
+  // we relax to a non-negativity check; the dispatch sizes the tile-state buffer to num_tiles and
+  // the kernel's loop already guarantees `idxTile < num_tiles`.
+  _CCCL_ASSERT(index >= 0, "Negative tile state index");
 
   tile_state_t<AccumT> res;
   if constexpr (sizeof(tile_state_t<AccumT>) <= cub::detail::warpspeed::max_native_atomic_size()

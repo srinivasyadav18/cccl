@@ -589,6 +589,10 @@ struct scan_warpspeed_policy
   int num_reduce_and_scan_warps;
   int look_ahead_items_per_thread;
   int items_per_thread;
+  // sm_90: warpspeed lacks HW cluster scheduling; tiles are claimed via a global atomic counter.
+  // When set, dispatch sizes the grid to min(sm_count, num_tiles) so all launched CTAs fit on the
+  // device concurrently (avoiding the static-scheduling deadlock with multi-tenant SMs).
+  bool atomic_scheduling = false;
 
   _CCCL_API constexpr int tile_size() const noexcept
   {
@@ -599,7 +603,7 @@ struct scan_warpspeed_policy
   {
     return lhs.num_reduce_and_scan_warps == rhs.num_reduce_and_scan_warps
         && lhs.look_ahead_items_per_thread == rhs.look_ahead_items_per_thread
-        && lhs.items_per_thread == rhs.items_per_thread;
+        && lhs.items_per_thread == rhs.items_per_thread && lhs.atomic_scheduling == rhs.atomic_scheduling;
   }
 
   _CCCL_API constexpr friend bool operator!=(const scan_warpspeed_policy& lhs, const scan_warpspeed_policy& rhs)
@@ -612,7 +616,8 @@ struct scan_warpspeed_policy
   {
     return os << "scan_warpspeed_policy { .num_reduce_and_scan_warps = " << p.num_reduce_and_scan_warps
               << ", .look_ahead_items_per_thread = " << p.look_ahead_items_per_thread
-              << ", .items_per_thread = " << p.items_per_thread << " }";
+              << ", .items_per_thread = " << p.items_per_thread
+              << ", .atomic_scheduling = " << (p.atomic_scheduling ? "true" : "false") << " }";
   }
 #endif // !_CCCL_COMPILER(NVRTC)
 };
@@ -872,6 +877,8 @@ struct policy_selector
   bool accum_is_primitive_or_trivially_copy_constructible;
   // TODO(griwes): remove this field before policy_selector is publicly exposed
   bool benchmark_match;
+  // Force warpspeed on SM90+ when run-to-run determinism is requested
+  bool force_warpspeed_for_determinism = false;
 
   _CCCL_API constexpr auto get_sm100_fallback_warpspeed_policy() const -> scan_warpspeed_policy
   {
@@ -953,6 +960,16 @@ struct policy_selector
       }
 
       return get_sm100_fallback_warpspeed_policy();
+    }
+    // sm_90 determinism path: warpspeed is enabled only for FP32+plus / FP64+plus (the targeted
+    // run-to-run-deterministic use case). The kernel uses atomicAdd-based work-stealing in place
+    // of clusterlaunchcontrol, so the dispatch sizes the grid to min(sm_count, num_tiles).
+    if (force_warpspeed_for_determinism && arch >= ::cuda::arch_id::sm_90 && operation_t == op_kind_t::plus
+        && (accum_type == type_t::float32 || accum_type == type_t::float64))
+    {
+      auto policy              = get_sm100_fallback_warpspeed_policy();
+      policy.atomic_scheduling = true;
+      return policy;
     }
     return {};
   }
@@ -1399,7 +1416,12 @@ struct benchmark_match_for_policy_selector<
 };
 
 // stateless version which can be passed to kernels
-template <typename InputIteratorT, typename OutputIteratorT, typename AccumT, typename OffsetT, typename ScanOpT>
+template <typename InputIteratorT,
+          typename OutputIteratorT,
+          typename AccumT,
+          typename OffsetT,
+          typename ScanOpT,
+          bool ForceWarpspeedForDeterminism = false>
 struct policy_selector_from_types
 {
   [[nodiscard]] _CCCL_API constexpr auto operator()(::cuda::arch_id arch) const -> scan_policy
@@ -1430,7 +1452,8 @@ struct policy_selector_from_types
       ::cuda::std::is_trivially_copyable_v<OutputValueT>,
       ::cuda::std::is_default_constructible_v<OutputValueT>,
       accum_is_primitive_or_trivially_copy_constructible,
-      benchmark_match};
+      benchmark_match,
+      ForceWarpspeedForDeterminism};
     return policies(arch);
   }
 };
