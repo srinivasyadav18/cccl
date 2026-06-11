@@ -170,7 +170,9 @@ _CCCL_DEVICE_API void warpLoadLookahead(
 // idxTileNext (where the returned value will NOT include the aggregate of idxTileNext).
 //
 // It does so by loading states in chunks of 32 * numTileStatesPerThread elements, starting from idxTilePrev + 1. From
-// the chunk of states, it tries to advance its knowledge of aggrExclusiveCta as much as possible. It loops until it can
+// the chunk of states, it advances its knowledge of aggrExclusiveCta one full 32-wide batch at a time (or a shorter
+// tail batch near idxTileNext): it waits until the whole batch of tile aggregates is published, then reduces it in one
+// shot, rather than greedily consuming the rightmost contiguous run of ready aggregates. It loops until it can
 // calculate the value of aggrExclusiveCta from the preceding states.
 //
 // The function must be called from a single warp. All passed arguments must be warp-uniform.
@@ -207,6 +209,18 @@ template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
 
     for (int idx = 0; idx < numTileStatesPerThread; ++idx)
     {
+      // Number of tiles to consume in this batch: a full 32-wide window, or the shorter tail batch
+      // near idxTileNext. We wait for and sum the entire batch in one reduction instead of greedily
+      // pulling the rightmost contiguous run of ready aggregates.
+      const int remaining = idxTileNext - idxTileCur;
+      if (remaining <= 0)
+      {
+        break;
+      }
+      const ::cuda::std::uint32_t expected_count =
+        remaining >= 32 ? 32u : static_cast<::cuda::std::uint32_t>(remaining);
+      const ::cuda::std::uint32_t expected_mask = expected_count >= 32 ? ~0u : ((1u << expected_count) - 1u);
+
       // Bitmask with a 1 bit in the position of the current lane if current lane has a tile aggregate
       const ::cuda::std::uint32_t lane_has_aggregate =
         lanemaskEq * (regTmpStates[idx].state == scan_state::tile_aggregate);
@@ -214,18 +228,13 @@ template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
       // Bitmask with 1 bits indicating which lane has a tile aggregate
       const ::cuda::std::uint32_t warp_has_aggregate_mask = warp_reduce_or.Reduce(lane_has_aggregate, or_op);
 
-      // Bitmask with 1 bits for all rightmost lanes having a tile aggregate
-      const ::cuda::std::uint32_t warp_right_aggregates_mask = warp_has_aggregate_mask & (~warp_has_aggregate_mask - 1);
-
-      // Cannot reduce if no rightmost tile aggregates
-      if (warp_right_aggregates_mask == 0)
+      // Only advance once the entire batch is ready; otherwise re-poll the window on the next iteration.
+      if ((warp_has_aggregate_mask & expected_mask) != expected_mask)
       {
         break;
       }
 
-      const ::cuda::std::uint32_t warp_right_aggregates_count = ::cuda::std::popcount(warp_right_aggregates_mask);
-
-      // Accumulate the rightmost tile aggregates
+      // Accumulate the whole 32-wide (or tail) batch of tile aggregates
       AccumT local_aggr;
       NV_IF_ELSE_TARGET(
         NV_PROVIDES_SM_80,
@@ -234,26 +243,24 @@ template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
                         && (is_cuda_std_plus_v<ScanOpT, AccumT> || is_cuda_minimum_maximum_v<ScanOpT, AccumT>
                             || is_cuda_std_bitwise_v<ScanOpT, AccumT>) )
           {
-            const bool use_value = lanemaskEq & warp_right_aggregates_mask;
+            const bool use_value = lanemaskEq & expected_mask;
             const AccumT value   = use_value ? regTmpStates[idx].value : cuda::identity_element<ScanOpT, AccumT>();
             local_aggr           = reduce_op_sync(value, ~0, scan_op);
           }
           else
           {
             // TODO(bgruber): this generates a LOT of SASS. I think it can do better.
-            local_aggr =
-              warp_reduce_t{temp_storage}.Reduce(regTmpStates[idx].value, scan_op, warp_right_aggregates_count);
+            local_aggr = warp_reduce_t{temp_storage}.Reduce(regTmpStates[idx].value, scan_op, expected_count);
           }
         }),
-        (local_aggr =
-           warp_reduce_t{temp_storage}.Reduce(regTmpStates[idx].value, scan_op, warp_right_aggregates_count);))
+        (local_aggr = warp_reduce_t{temp_storage}.Reduce(regTmpStates[idx].value, scan_op, expected_count);))
 
       // We never initialized aggrExclusiveCtaCur when starting look ahead at tile 0
       aggrExclusiveCtaCur = idxTileCur == 0 ? local_aggr : scan_op(aggrExclusiveCtaCur, local_aggr);
-      idxTileCur += warp_right_aggregates_count;
+      idxTileCur += static_cast<int>(expected_count);
 
-      // we can only continue on the next 32 tile states, if we consumed all 32 of this iteration
-      if (warp_right_aggregates_count < 32)
+      // The tail batch (< 32) reaches idxTileNext; stop consuming this chunk and let the outer loop exit.
+      if (expected_count < 32)
       {
         break;
       }
