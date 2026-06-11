@@ -305,20 +305,6 @@ struct lookahead_scan_closure
                       (squadGetNextBlockIdxAtomic(squad, refNextBlockIdxW, params.atomicCounter);));
   }
 
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE int claim_first_tile(const warpspeed::Squad& squad)
-  {
-    warpspeed::SmemStage stage = res.smemNextBlockIdx.nextStage();
-    auto [phaseW, phaseR]      = warpspeed::bindPhases<2>(stage);
-    if (squad == squadSched)
-    {
-      load_next_tile_index(squad, phaseW);
-    }
-    warpspeed::SmemRef ref = phaseR.acquireRef();
-    const int idxTile      = static_cast<int>(ref.data().x);
-    ref.setFenceLdsToAsyncProxy();
-    return idxTile;
-  }
-
   _CCCL_DEVICE_API _CCCL_FORCEINLINE void load_current_tile(
     const warpspeed::Squad& squad,
     warpspeed::SmemPhase<in_out_t>& phaseInOutW,
@@ -732,9 +718,23 @@ struct lookahead_scan_closure
 
     _CCCL_PDL_GRID_DEPENDENCY_SYNC();
 
+    // First tile. sm_100+: blockIdx.x (cluster scheduler owns the rest). sm_90: claimed from the counter (after the
+    // grid-dep sync so the init kernel's counter=0 is visible) and broadcast CTA-wide via a shared slot +
+    // __syncthreads. No static blockIdx.x ownership, so a CTA that never becomes resident owns no tile and cannot
+    // deadlock.
+    __shared__ int s_first_tile;
     int idxTile;
-    NV_IF_ELSE_TARGET(NV_PROVIDES_SM_100, (idxTile = specialRegisters.blockIdxX;), (idxTile = claim_first_tile(squad);));
+    NV_IF_ELSE_TARGET(NV_PROVIDES_SM_100, (idxTile = specialRegisters.blockIdxX;), ({
+                        if (specialRegisters.threadIdxX == 0)
+                        {
+                          s_first_tile = static_cast<int>(::atomicAdd(params.atomicCounter, 1u));
+                        }
+                        __syncthreads();
+                        idxTile = s_first_tile;
+                      }));
 
+    // A CTA whose first claim is already out of range (counter drained by faster CTAs) does no work; on sm_100
+    // idxTile == blockIdx.x < numTiles so this loops normally.
 #  pragma unroll 1
     while (idxTile < numTiles)
     {
