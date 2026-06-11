@@ -986,6 +986,12 @@ struct policy_selector
 
       return get_sm100_fallback_lookahead_policy();
     }
+    if (cc >= ::cuda::compute_capability{9, 0})
+    {
+      // sm_90 can run lookahead; it just uses atomic-counter scheduling instead of cluster-launch-control (selected by
+      // arch in the dispatch/kernel, not here). Reuse the sm_100 fallback tuning until sm_90-specific tunings exist.
+      return get_sm100_fallback_lookahead_policy();
+    }
     return {};
   }
 
