@@ -936,14 +936,6 @@ struct policy_selector
   _CCCL_HOST_DEVICE_API constexpr auto get_warpspeed_policy(::cuda::compute_capability cc) const
     -> ::cuda::std::optional<ScanWarpspeedPolicy>
   {
-#ifdef CUB_DEBUG_FORCE_SM90_ATOMIC_SCAN
-    if (cc >= ::cuda::compute_capability{9, 0})
-    {
-      auto policy              = get_sm100_fallback_warpspeed_policy();
-      policy.atomic_scheduling = true;
-      return policy;
-    }
-#endif
     if (cc >= ::cuda::compute_capability{12, 0})
     {
       return get_sm120_fallback_warpspeed_policy();
@@ -996,7 +988,7 @@ struct policy_selector
 
       return get_sm100_fallback_warpspeed_policy();
     }
-    if (cc >= ::cuda::compute_capability{9, 0})
+    if (cc >= ::cuda::compute_capability{9, 0} && require_stable_reduction_order)
     {
       auto policy              = get_sm100_fallback_warpspeed_policy();
       policy.atomic_scheduling = true;
@@ -1017,7 +1009,7 @@ struct policy_selector
   || ((_CCCL_COMPILER(MSVC) && _CCCL_CUDA_COMPILER(NVCC, <, 13, 1))) || defined(CCCL_DISABLE_WARPSPEED_SCAN)
     return false;
 #else
-#  if _CCCL_CUDACC_BELOW(13, 4) && !defined(CUB_DEBUG_FORCE_SM90_ATOMIC_SCAN)
+#  if _CCCL_CUDACC_BELOW(13, 4)
     if (cc == ::cuda::compute_capability{12, 0})
     {
       // Unfortunately, there seems to be a codegen bug in nvcc when targeting GB20x GPUs (sm120), so let's disable
