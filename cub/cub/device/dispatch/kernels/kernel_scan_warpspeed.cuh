@@ -132,6 +132,15 @@ _CCCL_DEVICE_API inline void squadGetNextBlockIdx(const warpspeed::Squad& squad,
   refDestSmem.squadIncreaseTxCount(squad, refDestSmem.sizeBytes());
 }
 
+_CCCL_DEVICE_API inline void squadGetNextBlockIdxAtomic(
+  const warpspeed::Squad& squad, warpspeed::SmemRef<uint4>& refDestSmem, ::cuda::std::uint32_t* atomicCounter)
+{
+  if (squad.isLeaderThread())
+  {
+    refDestSmem.data().x = ::atomicAdd(atomicCounter, 1u);
+  }
+}
+
 template <typename Tp, typename ScanOpT>
 _CCCL_DEVICE_API Tp warpReduce(const Tp input, ScanOpT& scan_op)
 {
@@ -289,7 +298,16 @@ struct warpspeed_scan_closure
   load_next_tile_index(const warpspeed::Squad& squad, warpspeed::SmemPhase<uint4>& phaseNextBlockIdxW) const
   {
     warpspeed::SmemRef refNextBlockIdxW = phaseNextBlockIdxW.acquireRef();
-    squadGetNextBlockIdx(squad, refNextBlockIdxW);
+    const int numTiles  = static_cast<int>(::cuda::ceil_div(params.numElem, ::cuda::std::size_t(tile_size)));
+    auto* atomicCounter = reinterpret_cast<::cuda::std::uint32_t*>(params.ptrTileStates + numTiles);
+#ifdef CUB_DEBUG_FORCE_SM90_ATOMIC_SCAN
+    squadGetNextBlockIdxAtomic(squad, refNextBlockIdxW, atomicCounter);
+#else
+    NV_IF_ELSE_TARGET(
+      NV_PROVIDES_SM_100,
+      (squadGetNextBlockIdx(squad, refNextBlockIdxW); (void) atomicCounter;),
+      (squadGetNextBlockIdxAtomic(squad, refNextBlockIdxW, atomicCounter);))
+#endif
   }
 
   _CCCL_DEVICE_API _CCCL_FORCEINLINE void load_current_tile(
@@ -317,7 +335,13 @@ struct warpspeed_scan_closure
       {
         // The stable-order version updates idxTilePrev/AggrExclusiveCtaPrev itself
         AccumT regAggrExclusiveCta = warpspeed::warpIncrementalLookaheadStable<lookahead_items_per_thread>(
-          specialRegisters, params.ptrTileStates, idxTilePrev, AggrExclusiveCtaPrev, idxTile, scan_op);
+          specialRegisters,
+          params.ptrTileStates,
+          idxTilePrev,
+          AggrExclusiveCtaPrev,
+          idxTile,
+          scan_op,
+          static_cast<int>(::cuda::ceil_div(params.numElem, ::cuda::std::size_t(tile_size))));
         if (squad.isLeaderThread())
         {
           refAggrExclusiveCtaW.data() = regAggrExclusiveCta;
@@ -326,7 +350,13 @@ struct warpspeed_scan_closure
       else
       {
         AccumT regAggrExclusiveCta = warpspeed::warpIncrementalLookahead<lookahead_items_per_thread>(
-          specialRegisters, params.ptrTileStates, idxTilePrev, AggrExclusiveCtaPrev, idxTile, scan_op);
+          specialRegisters,
+          params.ptrTileStates,
+          idxTilePrev,
+          AggrExclusiveCtaPrev,
+          idxTile,
+          scan_op,
+          static_cast<int>(::cuda::ceil_div(params.numElem, ::cuda::std::size_t(tile_size))));
         if (squad.isLeaderThread())
         {
           refAggrExclusiveCtaW.data() = regAggrExclusiveCta;
@@ -430,7 +460,12 @@ struct warpspeed_scan_closure
     // Store tile aggregate for lookahead
     if (squad.isLeaderThread())
     {
-      warpspeed::storeTileAggregate(params.ptrTileStates, warpspeed::scan_state::tile_aggregate, regSquadAggr, idxTile);
+      warpspeed::storeTileAggregate(
+        params.ptrTileStates,
+        warpspeed::scan_state::tile_aggregate,
+        regSquadAggr,
+        idxTile,
+        static_cast<int>(::cuda::ceil_div(params.numElem, ::cuda::std::size_t(tile_size))));
     }
 
     // Store thread aggregate
@@ -761,7 +796,17 @@ struct warpspeed_scan_closure
         regNextBlockIdx                     = refNextBlockIdxR.data();
         refNextBlockIdxR.setFenceLdsToAsyncProxy();
       }
-      bool nextIdxTileValid = ::cuda::ptx::clusterlaunchcontrol_query_cancel_is_canceled(regNextBlockIdx);
+      bool nextIdxTileValid = false;
+#ifdef CUB_DEBUG_FORCE_SM90_ATOMIC_SCAN
+      nextIdxTileValid = static_cast<int>(regNextBlockIdx.x)
+                       < static_cast<int>(::cuda::ceil_div(params.numElem, ::cuda::std::size_t(tile_size)));
+#else
+      NV_IF_ELSE_TARGET(
+        NV_PROVIDES_SM_100,
+        (nextIdxTileValid = ::cuda::ptx::clusterlaunchcontrol_query_cancel_is_canceled(regNextBlockIdx);),
+        (nextIdxTileValid = static_cast<int>(regNextBlockIdx.x)
+                          < static_cast<int>(::cuda::ceil_div(params.numElem, ::cuda::std::size_t(tile_size)));))
+#endif
 
       if (squad == squadReduce)
       {
@@ -808,7 +853,14 @@ struct warpspeed_scan_closure
       {
         break;
       }
-      idxTile = ::cuda::ptx::clusterlaunchcontrol_query_cancel_get_first_ctaid_x<int>(regNextBlockIdx);
+#ifdef CUB_DEBUG_FORCE_SM90_ATOMIC_SCAN
+      idxTile = static_cast<int>(regNextBlockIdx.x);
+#else
+      NV_IF_ELSE_TARGET(
+        NV_PROVIDES_SM_100,
+        (idxTile = ::cuda::ptx::clusterlaunchcontrol_query_cancel_get_first_ctaid_x<int>(regNextBlockIdx);),
+        (idxTile = static_cast<int>(regNextBlockIdx.x);))
+#endif
     }
 
     // epilogue: after the load squad finished, we can start ramping up the next kernel

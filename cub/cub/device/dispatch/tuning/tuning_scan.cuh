@@ -122,6 +122,8 @@ struct ScanWarpspeedPolicy
   // why.
   int block_idx_stages = -1; //!< Number of pipeline stages for stealing block indices
 
+  bool atomic_scheduling = false;
+
   _CCCL_HOST_DEVICE_API constexpr int tile_size() const noexcept
   {
     return items_per_thread * reduce_and_scan_warps * cub::detail::warp_threads;
@@ -131,7 +133,8 @@ struct ScanWarpspeedPolicy
   {
     return lhs.reduce_and_scan_warps == rhs.reduce_and_scan_warps && lhs.items_per_thread == rhs.items_per_thread
         && lhs.lookahead_items_per_thread == rhs.lookahead_items_per_thread
-        && lhs.lookahead_stages == rhs.lookahead_stages && lhs.block_idx_stages == rhs.block_idx_stages;
+        && lhs.lookahead_stages == rhs.lookahead_stages && lhs.block_idx_stages == rhs.block_idx_stages
+        && lhs.atomic_scheduling == rhs.atomic_scheduling;
   }
 
   _CCCL_HOST_DEVICE_API constexpr friend bool operator!=(const ScanWarpspeedPolicy& lhs, const ScanWarpspeedPolicy& rhs)
@@ -145,7 +148,8 @@ struct ScanWarpspeedPolicy
     return os
         << "ScanWarpspeedPolicy { .reduce_and_scan_warps = " << p.reduce_and_scan_warps << ", .items_per_thread = "
         << p.items_per_thread << ", .lookahead_items_per_thread = " << p.lookahead_items_per_thread
-        << ", .lookahead_stages = " << p.lookahead_stages << ", .block_idx_stages = " << p.block_idx_stages << " }";
+        << ", .lookahead_stages = " << p.lookahead_stages << ", .block_idx_stages = " << p.block_idx_stages
+        << ", .atomic_scheduling = " << p.atomic_scheduling << " }";
   }
 #endif // _CCCL_HOSTED()
 };
@@ -932,6 +936,14 @@ struct policy_selector
   _CCCL_HOST_DEVICE_API constexpr auto get_warpspeed_policy(::cuda::compute_capability cc) const
     -> ::cuda::std::optional<ScanWarpspeedPolicy>
   {
+#ifdef CUB_DEBUG_FORCE_SM90_ATOMIC_SCAN
+    if (cc >= ::cuda::compute_capability{9, 0})
+    {
+      auto policy              = get_sm100_fallback_warpspeed_policy();
+      policy.atomic_scheduling = true;
+      return policy;
+    }
+#endif
     if (cc >= ::cuda::compute_capability{12, 0})
     {
       return get_sm120_fallback_warpspeed_policy();
@@ -984,6 +996,12 @@ struct policy_selector
 
       return get_sm100_fallback_warpspeed_policy();
     }
+    if (cc >= ::cuda::compute_capability{9, 0})
+    {
+      auto policy              = get_sm100_fallback_warpspeed_policy();
+      policy.atomic_scheduling = true;
+      return policy;
+    }
     return {};
   }
 
@@ -999,7 +1017,7 @@ struct policy_selector
   || ((_CCCL_COMPILER(MSVC) && _CCCL_CUDA_COMPILER(NVCC, <, 13, 1))) || defined(CCCL_DISABLE_WARPSPEED_SCAN)
     return false;
 #else
-#  if _CCCL_CUDACC_BELOW(13, 4)
+#  if _CCCL_CUDACC_BELOW(13, 4) && !defined(CUB_DEBUG_FORCE_SM90_ATOMIC_SCAN)
     if (cc == ::cuda::compute_capability{12, 0})
     {
       // Unfortunately, there seems to be a codegen bug in nvcc when targeting GB20x GPUs (sm120), so let's disable
@@ -1032,10 +1050,7 @@ struct policy_selector
 
   [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr auto operator()(::cuda::compute_capability cc) const -> ScanPolicy
   {
-    // we first try to get the valid warpspeed implementation. if we can't run it, fall back to the old scan impl.
-    // For stable reduction order (fp + plus), warpspeed can only be used on sm_100+, Older arches fall back to classic
-    // lookback stable reduction order implementation below.
-    if (!require_stable_reduction_order || cc >= ::cuda::compute_capability{10, 0})
+    if (!require_stable_reduction_order || cc >= ::cuda::compute_capability{9, 0})
     {
       const auto warpspeed_policy_opt = get_warpspeed_policy(cc);
       if (warpspeed_policy_opt && can_use_warpspeed(cc, *warpspeed_policy_opt))

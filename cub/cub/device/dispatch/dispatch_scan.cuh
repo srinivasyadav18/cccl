@@ -501,7 +501,8 @@ struct DispatchScan
 
     if (d_temp_storage == nullptr)
     {
-      temp_storage_bytes = static_cast<size_t>(grid_dim) * kernel_source.lookahead_tile_state_size();
+      temp_storage_bytes =
+        static_cast<size_t>(grid_dim) * kernel_source.lookahead_tile_state_size() + sizeof(::cuda::std::uint32_t);
       return cudaSuccess;
     }
 
@@ -515,6 +516,9 @@ struct DispatchScan
     {
       return error;
     }
+
+    const int scan_grid_dim = warpspeed_policy.atomic_scheduling ? ::cuda::std::min(sm_count, grid_dim) : grid_dim;
+
     // Maximum dynamic shared memory size that we can use for temporary storage.
     int max_dynamic_smem_size{};
     if (const auto error =
@@ -618,16 +622,32 @@ struct DispatchScan
       }
     }
 
+    if (warpspeed_policy.atomic_scheduling)
+    {
+      auto* d_atomic_counter = reinterpret_cast<::cuda::std::uint32_t*>(
+        static_cast<char*>(d_temp_storage) + static_cast<size_t>(grid_dim) * kernel_source.lookahead_tile_state_size());
+      const ::cuda::std::uint32_t initial_counter_value = static_cast<::cuda::std::uint32_t>(scan_grid_dim);
+      if (const auto error = CubDebug(cudaMemcpyAsync(
+            d_atomic_counter, &initial_counter_value, sizeof(::cuda::std::uint32_t), cudaMemcpyHostToDevice, stream)))
+      {
+        return error;
+      }
+    }
+
     // Invoke scan kernel
     {
       const int block_dim = detail::scan::num_total_threads(warpspeed_policy);
 
 #  ifdef CUB_DEBUG_LOG
-      _CubLog("Invoking DeviceScanKernel<<<%d, %d, %d, %lld>>>()\n", grid_dim, block_dim, smem_size, (long long) stream);
+      _CubLog("Invoking DeviceScanKernel<<<%d, %d, %d, %lld>>>()\n",
+              scan_grid_dim,
+              block_dim,
+              smem_size,
+              (long long) stream);
 #  endif // CUB_DEBUG_LOG
 
       if (const auto error = CubDebug(
-            launcher_factory(grid_dim, block_dim, smem_size, stream, /* dependent_launch */ ptx_version >= 900)
+            launcher_factory(scan_grid_dim, block_dim, smem_size, stream, /* dependent_launch */ ptx_version >= 900)
               .doit(scan_kernel,
                     THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator(d_in),
                     THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator(d_out),
