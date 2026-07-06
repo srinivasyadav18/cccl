@@ -186,8 +186,8 @@ template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
   ScanOpT& scan_op,
   const int num_tiles)
 {
-  const int laneIdx                      = specialRegisters.laneIdx;
-  const ::cuda::std::uint32_t lanemaskEq = ::cuda::ptx::get_sreg_lanemask_eq();
+  const int laneIdx                                       = static_cast<int>(specialRegisters.laneIdx);
+  [[maybe_unused]] const ::cuda::std::uint32_t lanemaskEq = ::cuda::ptx::get_sreg_lanemask_eq();
 
   int idxTileCur             = idxTilePrev;
   AccumT aggrExclusiveCtaCur = aggrExclusiveCtaPrev;
@@ -197,11 +197,6 @@ template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
                 "WarpReduce for a full warp must not require temporary storage");
   [[maybe_unused]] typename warp_reduce_t::TempStorage temp_storage;
 
-  using warp_reduce_or_t = WarpReduce<::cuda::std::uint32_t>;
-  warp_reduce_or_t::TempStorage temp_storage_or;
-  warp_reduce_or_t warp_reduce_or{temp_storage_or};
-  constexpr ::cuda::std::bit_or<::cuda::std::uint32_t> or_op{};
-
   while (idxTileCur < idxTileNext)
   {
     tile_state_t<AccumT> regTmpStates[numTileStatesPerThread];
@@ -209,12 +204,9 @@ template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
 
     for (int idx = 0; idx < numTileStatesPerThread; ++idx)
     {
-      // Bitmask with a 1 bit in the position of the current lane if current lane has a tile aggregate
-      const ::cuda::std::uint32_t lane_has_aggregate =
-        lanemaskEq * (regTmpStates[idx].state == scan_state::tile_aggregate);
-
       // Bitmask with 1 bits indicating which lane has a tile aggregate
-      const ::cuda::std::uint32_t warp_has_aggregate_mask = warp_reduce_or.Reduce(lane_has_aggregate, or_op);
+      const ::cuda::std::uint32_t warp_has_aggregate_mask =
+        __ballot_sync(0xffffffffu, regTmpStates[idx].state == scan_state::tile_aggregate);
 
       // Bitmask with 1 bits for all rightmost lanes having a tile aggregate
       const ::cuda::std::uint32_t warp_right_aggregates_mask = warp_has_aggregate_mask & (~warp_has_aggregate_mask - 1);
@@ -279,7 +271,7 @@ template <int numTileStatesPerThread, typename AccumT, typename ScanOpT>
   ScanOpT& scan_op,
   const int num_tiles)
 {
-  const int laneIdx                      = specialRegisters.laneIdx;
+  const int laneIdx                      = static_cast<int>(specialRegisters.laneIdx);
   const ::cuda::std::uint32_t lanemaskEq = ::cuda::ptx::get_sreg_lanemask_eq();
 
   int idxTileCur             = idxTilePrev;
