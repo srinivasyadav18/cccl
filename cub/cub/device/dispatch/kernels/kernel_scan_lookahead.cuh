@@ -34,6 +34,7 @@
 #include <cuda/std/__algorithm/clamp.h>
 #include <cuda/std/__algorithm/max.h>
 #include <cuda/std/__cccl/cuda_capabilities.h>
+#include <cuda/std/__type_traits/conditional.h>
 #include <cuda/std/__type_traits/is_same.h>
 #include <cuda/std/array>
 
@@ -295,7 +296,8 @@ struct lookahead_scan_closure
   const scanKernelParams<InputT, OutputT, AccumT> params;
   mutable ScanOpT scan_op; // mutable, so we can support non-const operator()
   const RealInitValueT real_init_value;
-  scan_resources_t res; // this is the only shared mutable state
+  ::cuda::std::conditional_t<(sizeof(AccumT) <= 4), scan_resources_t, scan_resources_t&> res; // this is the only shared
+                                                                                              // mutable state
 
   _CCCL_DEVICE_API _CCCL_FORCEINLINE void
   load_next_tile_index(const warpspeed::Squad& squad, warpspeed::SmemPhase<uint4>& phaseNextBlockIdxW) const
